@@ -5,6 +5,7 @@ import type { GeminiKeyStatus, SettingsDoc, StoredGeminiApiKey } from '../types.
 import { getServerEncryptionSecret } from './authService.ts';
 
 export const GEMINI_MODEL = 'gemini-4-hydrogen';
+export const GEMINI_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 export const ENV_GEMINI_KEY_ID = '__env__';
 
 const RATE_LIMIT_COOLDOWN_MS = 65_000;
@@ -35,7 +36,6 @@ interface CandidateKey {
   cooldownUntil?: Date;
 }
 
-// Runtime tracking for optional .env fallback key (not stored in DB)
 const envKeyRuntime: {
   status: GeminiKeyStatus;
   cooldownUntil?: Date;
@@ -92,6 +92,29 @@ export function maskApiKey(plainKey: string): string {
   return `${clean.slice(0, 6)}••••••${clean.slice(-4)}`;
 }
 
+export function formatGeminiErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { code?: number; message?: string; status?: string };
+        message?: string;
+      };
+      if (parsed?.error?.message) {
+        const codePart = parsed.error.code ? ` (${parsed.error.code})` : '';
+        return `${parsed.error.message}${codePart}`.slice(0, 220);
+      }
+      if (parsed?.message) {
+        return parsed.message.slice(0, 220);
+      }
+    } catch {
+      // Fall through to raw cleanup
+    }
+  }
+  return trimmed.slice(0, 220);
+}
+
 function getClientForKey(plainKey: string): GoogleGenAI {
   const hash = hashApiKey(plainKey);
   const existing = clientCache.get(hash);
@@ -131,8 +154,9 @@ export function getGeminiPoolStatusSync(): {
 }
 
 function isRateLimitError(err: unknown): { matched: boolean; isDaily: boolean; message: string } {
-  const message = err instanceof Error ? err.message : String(err);
-  const status = (err as { status?: number; code?: number })?.status ??
+  const message = formatGeminiErrorMessage(err);
+  const status =
+    (err as { status?: number; code?: number })?.status ??
     (err as { code?: number })?.code;
   const lower = message.toLowerCase();
   const matched =
@@ -148,7 +172,7 @@ function isRateLimitError(err: unknown): { matched: boolean; isDaily: boolean; m
 }
 
 function isInvalidKeyError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = formatGeminiErrorMessage(err);
   const status = (err as { status?: number; code?: number })?.status;
   const lower = message.toLowerCase();
   return (
@@ -161,16 +185,20 @@ function isInvalidKeyError(err: unknown): boolean {
   );
 }
 
-function isTransientNetworkError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  const status = (err as { status?: number })?.status;
-  const lower = message.toLowerCase();
+function isModelOverloadOrUnavailableError(err: unknown): boolean {
+  const raw = err instanceof Error ? err.message : String(err);
+  const status = (err as { status?: number; code?: number })?.status ?? (err as { code?: number })?.code;
+  const lower = raw.toLowerCase();
   return (
-    status === 500 ||
     status === 503 ||
-    /\b(500|502|503|504)\b/.test(message) ||
-    lower.includes('timeout') ||
+    status === 500 ||
+    status === 502 ||
+    status === 504 ||
+    /\b(500|502|503|504)\b/.test(raw) ||
+    lower.includes('high demand') ||
     lower.includes('unavailable') ||
+    lower.includes('overloaded') ||
+    lower.includes('timeout') ||
     lower.includes('econnreset') ||
     lower.includes('fetch failed')
   );
@@ -225,7 +253,7 @@ async function buildCandidatePool(): Promise<{
         cooldownUntil: k.cooldownUntil ? new Date(k.cooldownUntil) : undefined,
       });
     } catch {
-      // Skip keys that cannot be decrypted
+      // Skip unreadable keys
     }
   }
 
@@ -268,7 +296,6 @@ function orderCandidatesStickily(candidates: CandidateKey[], activeKeyId?: strin
       ? [...nonInvalid.slice(currentIdx), ...nonInvalid.slice(0, currentIdx)]
       : [...nonInvalid];
 
-  // Prioritize keys NOT in active cooldown while preserving sticky order
   const ready = rotated.filter(
     (c) => c.status !== 'rate_limited' || !c.cooldownUntil || c.cooldownUntil.getTime() <= now,
   );
@@ -340,11 +367,15 @@ async function recordKeyOutcome(params: {
 }
 
 /**
- * Executes a Gemini operation using the current sticky key until a rate-limit
- * (or invalid key error) occurs, then automatically shifts to the next key.
+ * Runs a Gemini operation with:
+ * 1) Sticky active key (only shifts to next key on 429 rate limit or invalid key)
+ * 2) Automatic retry + fallback model (gemini-4-hydrogen -> gemini-3.1-flash-lite) on 503 high demand
  */
 export async function executeWithGemini<T>(
-  operation: (ai: GoogleGenAI, meta: { keyId: string; label: string }) => Promise<T>,
+  operation: (
+    ai: GoogleGenAI,
+    meta: { keyId: string; label: string; model: string },
+  ) => Promise<T>,
 ): Promise<T> {
   const { candidates, activeKeyId } = await buildCandidatePool();
   if (candidates.length === 0) {
@@ -360,86 +391,97 @@ export async function executeWithGemini<T>(
     );
   }
 
+  const modelsToTry = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
   let lastError: unknown;
 
   for (const candidate of ordered) {
     const client = getClientForKey(candidate.plainKey);
+    let keyFailedForKeyReason = false;
 
-    for (let transientAttempt = 0; transientAttempt < 2; transientAttempt++) {
-      try {
-        const result = await operation(client, {
-          keyId: candidate.id,
-          label: candidate.label,
-        });
+    for (const model of modelsToTry) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const result = await operation(client, {
+            keyId: candidate.id,
+            label: candidate.label,
+            model,
+          });
 
-        await recordKeyOutcome({
-          keyId: candidate.id,
-          source: candidate.source,
-          status: 'active',
-          cooldownUntil: undefined,
-          lastError: undefined,
-          incrementSuccess: true,
-          setAsCurrent: candidate.id !== activeKeyId || candidate.status !== 'active',
-        });
-
-        return result;
-      } catch (err) {
-        lastError = err;
-
-        const rateLimit = isRateLimitError(err);
-        if (rateLimit.matched) {
-          const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
-          const cooldownUntil = new Date(Date.now() + cooldownMs);
-          console.warn(
-            `[gemini-pool] Key "${candidate.label}" hit rate limit; shifting to next key.`,
-          );
           await recordKeyOutcome({
             keyId: candidate.id,
             source: candidate.source,
-            status: 'rate_limited',
-            cooldownUntil,
-            lastError: rateLimit.message.slice(0, 240),
+            status: 'active',
+            cooldownUntil: undefined,
+            lastError: undefined,
+            incrementSuccess: true,
+            setAsCurrent: candidate.id !== activeKeyId || candidate.status !== 'active',
           });
-          break; // Immediately shift to next key
-        }
 
-        if (isInvalidKeyError(err)) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[gemini-pool] Key "${candidate.label}" rejected as invalid; shifting.`);
-          await recordKeyOutcome({
-            keyId: candidate.id,
-            source: candidate.source,
-            status: 'invalid',
-            lastError: msg.slice(0, 240),
-          });
-          break; // Shift to next key
-        }
+          return result;
+        } catch (err) {
+          lastError = err;
 
-        if (isTransientNetworkError(err) && transientAttempt === 0) {
-          await new Promise((r) => setTimeout(r, 350));
-          continue;
-        }
+          const rateLimit = isRateLimitError(err);
+          if (rateLimit.matched) {
+            const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
+            const cooldownUntil = new Date(Date.now() + cooldownMs);
+            console.warn(
+              `[gemini-pool] Key "${candidate.label}" hit rate limit; shifting to next key.`,
+            );
+            await recordKeyOutcome({
+              keyId: candidate.id,
+              source: candidate.source,
+              status: 'rate_limited',
+              cooldownUntil,
+              lastError: rateLimit.message,
+            });
+            keyFailedForKeyReason = true;
+            break;
+          }
 
-        // Non-key error (e.g., bad prompt/schema) or persistent transient error
-        if (isTransientNetworkError(err)) {
-          break; // Try next key on persistent 5xx
+          if (isInvalidKeyError(err)) {
+            const msg = formatGeminiErrorMessage(err);
+            console.warn(`[gemini-pool] Key "${candidate.label}" rejected as invalid; shifting.`);
+            await recordKeyOutcome({
+              keyId: candidate.id,
+              source: candidate.source,
+              status: 'invalid',
+              lastError: msg,
+            });
+            keyFailedForKeyReason = true;
+            break;
+          }
+
+          if (isModelOverloadOrUnavailableError(err)) {
+            if (attempt === 0) {
+              await new Promise((r) => setTimeout(r, 450));
+              continue;
+            }
+            // Retry on fallback model using the same key
+            console.warn(
+              `[gemini-pool] Model "${model}" temporarily unavailable (503); trying next fallback.`,
+            );
+            break;
+          }
+
+          throw new Error(formatGeminiErrorMessage(err));
         }
-        throw err;
       }
+
+      if (keyFailedForKeyReason) break;
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('All available Gemini API keys failed or exceeded rate limits.');
+  throw new Error(formatGeminiErrorMessage(lastError));
 }
 
 /**
- * Streaming variant that fails over cleanly before yielding the first chunk.
+ * Streaming variant with sticky key rotation + 503 model fallback before emitting chunks.
  */
 export async function* executeWithGeminiStream(
   createStream: (
     ai: GoogleGenAI,
+    meta: { model: string },
   ) => Promise<AsyncIterable<{ text?: string }>>,
 ): AsyncGenerator<{ text?: string }> {
   const { candidates, activeKeyId } = await buildCandidatePool();
@@ -456,71 +498,81 @@ export async function* executeWithGeminiStream(
     );
   }
 
+  const modelsToTry = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
   let lastError: unknown;
 
   for (const candidate of ordered) {
     const client = getClientForKey(candidate.plainKey);
-    try {
-      const iterable = await createStream(client);
-      const iterator = iterable[Symbol.asyncIterator]();
-      const first = await iterator.next();
+    let keyFailedForKeyReason = false;
 
-      await recordKeyOutcome({
-        keyId: candidate.id,
-        source: candidate.source,
-        status: 'active',
-        cooldownUntil: undefined,
-        lastError: undefined,
-        incrementSuccess: true,
-        setAsCurrent: candidate.id !== activeKeyId || candidate.status !== 'active',
-      });
+    for (const model of modelsToTry) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const iterable = await createStream(client, { model });
+          const iterator = iterable[Symbol.asyncIterator]();
+          const first = await iterator.next();
 
-      if (!first.done) {
-        yield first.value;
+          await recordKeyOutcome({
+            keyId: candidate.id,
+            source: candidate.source,
+            status: 'active',
+            cooldownUntil: undefined,
+            lastError: undefined,
+            incrementSuccess: true,
+            setAsCurrent: candidate.id !== activeKeyId || candidate.status !== 'active',
+          });
+
+          if (!first.done) {
+            yield first.value;
+          }
+          while (true) {
+            const next = await iterator.next();
+            if (next.done) break;
+            yield next.value;
+          }
+          return;
+        } catch (err) {
+          lastError = err;
+          const rateLimit = isRateLimitError(err);
+          if (rateLimit.matched) {
+            const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
+            await recordKeyOutcome({
+              keyId: candidate.id,
+              source: candidate.source,
+              status: 'rate_limited',
+              cooldownUntil: new Date(Date.now() + cooldownMs),
+              lastError: rateLimit.message,
+            });
+            keyFailedForKeyReason = true;
+            break;
+          }
+          if (isInvalidKeyError(err)) {
+            await recordKeyOutcome({
+              keyId: candidate.id,
+              source: candidate.source,
+              status: 'invalid',
+              lastError: formatGeminiErrorMessage(err),
+            });
+            keyFailedForKeyReason = true;
+            break;
+          }
+          if (isModelOverloadOrUnavailableError(err)) {
+            if (attempt === 0) {
+              await new Promise((r) => setTimeout(r, 450));
+              continue;
+            }
+            break;
+          }
+          throw new Error(formatGeminiErrorMessage(err));
+        }
       }
-      while (true) {
-        const next = await iterator.next();
-        if (next.done) break;
-        yield next.value;
-      }
-      return;
-    } catch (err) {
-      lastError = err;
-      const rateLimit = isRateLimitError(err);
-      if (rateLimit.matched) {
-        const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
-        await recordKeyOutcome({
-          keyId: candidate.id,
-          source: candidate.source,
-          status: 'rate_limited',
-          cooldownUntil: new Date(Date.now() + cooldownMs),
-          lastError: rateLimit.message.slice(0, 240),
-        });
-        continue;
-      }
-      if (isInvalidKeyError(err)) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await recordKeyOutcome({
-          keyId: candidate.id,
-          source: candidate.source,
-          status: 'invalid',
-          lastError: msg.slice(0, 240),
-        });
-        continue;
-      }
-      if (isTransientNetworkError(err)) {
-        continue;
-      }
-      throw err;
+      if (keyFailedForKeyReason) break;
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('All available Gemini API keys failed or exceeded rate limits.');
+  throw new Error(formatGeminiErrorMessage(lastError));
 }
 
-// Legacy compatibility wrapper
 export async function withGeminiRetry<T>(fn: () => Promise<T>, maxAttempts = 2): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -528,13 +580,13 @@ export async function withGeminiRetry<T>(fn: () => Promise<T>, maxAttempts = 2):
       return await fn();
     } catch (err) {
       lastError = err;
-      if (!isTransientNetworkError(err) || attempt === maxAttempts - 1) {
+      if (!isModelOverloadOrUnavailableError(err) || attempt === maxAttempts - 1) {
         throw err;
       }
-      await new Promise((resolve) => setTimeout(resolve, 350 * Math.pow(2, attempt)));
+      await new Promise((resolve) => setTimeout(resolve, 400 * Math.pow(2, attempt)));
     }
   }
-  throw lastError instanceof Error ? lastError : new Error('Gemini request failed.');
+  throw new Error(formatGeminiErrorMessage(lastError));
 }
 
 export async function listGeminiKeySummaries(): Promise<{
@@ -554,6 +606,12 @@ export async function listGeminiKeySummaries(): Promise<{
   const summaries: GeminiApiKeySummary[] = stored.map((k) => {
     seenHashes.add(k.keyHash);
     const eff = effectiveStatus(k);
+    // Do not display stale 503 transient errors as key errors
+    const cleanLastError =
+      k.lastError && !k.lastError.includes('"code":503') && !k.lastError.includes('high demand')
+        ? formatGeminiErrorMessage(k.lastError)
+        : undefined;
+
     return {
       id: k.id,
       label: k.label,
@@ -566,7 +624,7 @@ export async function listGeminiKeySummaries(): Promise<{
         eff === 'rate_limited' && k.cooldownUntil
           ? new Date(k.cooldownUntil).toISOString()
           : undefined,
-      lastError: k.lastError,
+      lastError: cleanLastError,
       lastUsedAt: k.lastUsedAt ? new Date(k.lastUsedAt).toISOString() : undefined,
       requestCount: k.requestCount || 0,
       createdAt: new Date(k.createdAt).toISOString(),
@@ -595,7 +653,9 @@ export async function listGeminiKeySummaries(): Promise<{
           eff === 'rate_limited' && envKeyRuntime.cooldownUntil
             ? envKeyRuntime.cooldownUntil.toISOString()
             : undefined,
-        lastError: envKeyRuntime.lastError,
+        lastError: envKeyRuntime.lastError
+          ? formatGeminiErrorMessage(envKeyRuntime.lastError)
+          : undefined,
         lastUsedAt: envKeyRuntime.lastUsedAt?.toISOString(),
         requestCount: envKeyRuntime.requestCount,
         createdAt: new Date(0).toISOString(),
@@ -808,52 +868,102 @@ export async function testGeminiApiKey(id: string): Promise<{
     throw new Error('API key value is unavailable.');
   }
 
-  try {
-    const client = getClientForKey(plainKey);
-    await client.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: 'Reply with OK.',
-    });
-    await recordKeyOutcome({
-      keyId: id,
-      source,
-      status: 'active',
-      cooldownUntil: undefined,
-      lastError: undefined,
-      incrementSuccess: true,
-    });
-    return { ok: true, status: 'active', message: 'API key is valid and ready.' };
-  } catch (err) {
-    const rateLimit = isRateLimitError(err);
-    if (rateLimit.matched) {
-      const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
-      await recordKeyOutcome({
-        keyId: id,
-        source,
-        status: 'rate_limited',
-        cooldownUntil: new Date(Date.now() + cooldownMs),
-        lastError: rateLimit.message.slice(0, 240),
-      });
-      return {
-        ok: false,
-        status: 'rate_limited',
-        message: 'Key hit rate limit; pool will auto-shift to another key.',
-      };
-    }
+  const client = getClientForKey(plainKey);
+  const modelsToTry = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
+  let lastError: unknown;
 
-    const msg = err instanceof Error ? err.message : String(err);
-    const invalid = isInvalidKeyError(err);
-    const nextStatus: GeminiKeyStatus = invalid ? 'invalid' : 'active';
-    await recordKeyOutcome({
-      keyId: id,
-      source,
-      status: nextStatus,
-      lastError: msg.slice(0, 240),
-    });
-    return {
-      ok: false,
-      status: nextStatus,
-      message: msg.slice(0, 200),
-    };
+  for (const model of modelsToTry) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await client.models.generateContent({
+          model,
+          contents: 'Reply with OK.',
+        });
+        await recordKeyOutcome({
+          keyId: id,
+          source,
+          status: 'active',
+          cooldownUntil: undefined,
+          lastError: undefined,
+          incrementSuccess: true,
+        });
+        return {
+          ok: true,
+          status: 'active',
+          message:
+            model === GEMINI_MODEL
+              ? 'API key is valid and ready.'
+              : `API key is valid (verified on ${model} while primary model was busy).`,
+        };
+      } catch (err) {
+        lastError = err;
+        const rateLimit = isRateLimitError(err);
+        if (rateLimit.matched) {
+          const cooldownMs = rateLimit.isDaily ? DAILY_QUOTA_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
+          await recordKeyOutcome({
+            keyId: id,
+            source,
+            status: 'rate_limited',
+            cooldownUntil: new Date(Date.now() + cooldownMs),
+            lastError: rateLimit.message,
+          });
+          return {
+            ok: false,
+            status: 'rate_limited',
+            message: 'Key hit rate limit; pool will auto-shift to another key.',
+          };
+        }
+
+        if (isInvalidKeyError(err)) {
+          const msg = formatGeminiErrorMessage(err);
+          await recordKeyOutcome({
+            keyId: id,
+            source,
+            status: 'invalid',
+            lastError: msg,
+          });
+          return {
+            ok: false,
+            status: 'invalid',
+            message: msg,
+          };
+        }
+
+        if (isModelOverloadOrUnavailableError(err)) {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 450));
+            continue;
+          }
+          break; // Try fallback model
+        }
+
+        const msg = formatGeminiErrorMessage(err);
+        await recordKeyOutcome({
+          keyId: id,
+          source,
+          status: 'active',
+          lastError: msg,
+        });
+        return {
+          ok: false,
+          status: 'active',
+          message: msg,
+        };
+      }
+    }
   }
+
+  // If all models returned temporary 503 UNAVAILABLE, don't blame the key itself
+  await recordKeyOutcome({
+    keyId: id,
+    source,
+    status: 'active',
+    lastError: undefined,
+  });
+  return {
+    ok: false,
+    status: 'active',
+    message:
+      'Google Gemini servers are experiencing a temporary 503 demand spike. Your key is fine—please try again in a few seconds.',
+  };
 }

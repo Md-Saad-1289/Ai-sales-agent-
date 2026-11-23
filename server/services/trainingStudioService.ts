@@ -8,7 +8,7 @@ import type {
 } from '../types.ts';
 import { recordAuditLog } from './auditService.ts';
 import { parseAndChunkDocument, sanitizeUntrustedDocumentText } from './documentParserService.ts';
-import { executeWithGeminiStream, GEMINI_MODEL } from './geminiClient.ts';
+import { executeWithGeminiStream } from './geminiClient.ts';
 import {
   analyzeKnowledgeGaps,
   createProposalsFromExtractedItems,
@@ -200,9 +200,9 @@ export async function processTrainingChatTurn(params: {
   ].join('\n\n');
 
   let aiReplyText = '';
-  const stream = executeWithGeminiStream((ai) =>
+  const stream = executeWithGeminiStream((ai, meta) =>
     ai.models.generateContentStream({
-      model: GEMINI_MODEL,
+      model: meta.model,
       contents: prompt,
       config: { systemInstruction },
     }),

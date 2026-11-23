@@ -4,7 +4,7 @@ import type { BuyingIntent, DraftOrderState, OrderDoc, ProductDoc } from '../typ
 import { buildConversationContext, sanitizeUntrustedText } from './contextService.ts';
 import { setConversationAIState, updateConversationDraftOrder } from './conversationService.ts';
 import { updateCustomerInsights } from './customerService.ts';
-import { executeWithGemini, GEMINI_MODEL } from './geminiClient.ts';
+import { executeWithGemini } from './geminiClient.ts';
 import { computeDraftSummaryHash, createValidatedOrder } from './orderService.ts';
 
 const aiResponseZodSchema = z.object({
@@ -227,9 +227,9 @@ export async function runAISalesAgent(params: {
     `</customer_message>`,
   ].join('\n');
 
-  const response = await executeWithGemini((ai) =>
+  const response = await executeWithGemini((ai, meta) =>
     ai.models.generateContent({
-      model: GEMINI_MODEL,
+      model: meta.model,
       contents: userPrompt,
     config: {
       systemInstruction,

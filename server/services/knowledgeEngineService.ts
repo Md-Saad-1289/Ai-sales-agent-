@@ -13,7 +13,7 @@ import type {
   ProposedKnowledgePayload,
   ProposedProductPayload,
 } from '../types.ts';
-import { executeWithGemini, GEMINI_MODEL } from './geminiClient.ts';
+import { executeWithGemini } from './geminiClient.ts';
 import { KNOWLEDGE_CATEGORIES } from './memoryCompilerService.ts';
 import { emitRealtimeEvent } from './realtimeService.ts';
 import { getSettings } from './settingsService.ts';
@@ -454,9 +454,9 @@ export async function extractStructuredItemsFromText(params: {
     `</untrusted_content>`,
   ].join('\n\n');
 
-  const response = await executeWithGemini((ai) =>
+  const response = await executeWithGemini((ai, meta) =>
     ai.models.generateContent({
-      model: GEMINI_MODEL,
+      model: meta.model,
       contents: prompt,
       config: {
         systemInstruction,

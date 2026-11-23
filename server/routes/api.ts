@@ -1,9 +1,46 @@
 import { timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
 import { z } from 'zod';
 import { getCollections } from '../db/mongo.ts';
+import type { KnowledgeCategory } from '../types.ts';
+import { listAuditLogs } from '../services/auditService.ts';
+import { MAX_UPLOAD_BYTES } from '../services/documentParserService.ts';
+import { createProposalsFromExtractedItems } from '../services/knowledgeEngineService.ts';
 import {
+  compileShortMemoryScript,
+  getActiveMemoryScript,
+  KNOWLEDGE_CATEGORIES,
+  listApprovedKnowledgeEntries,
+  listMemoryScriptVersions,
+  saveManualMemoryScriptEdit,
+} from '../services/memoryCompilerService.ts';
+import {
+  type AdminActor,
+  approveProposal,
+  archiveKnowledgeEntry,
+  editApprovedKnowledgeEntry,
+  editKnowledgeEntrySchema,
+  editProposal,
+  editProposalSchema,
+  getKnowledgeEntryDetail,
+  listProposals,
+  rejectProposal,
+  requestProposalClarification,
+  restoreArchivedKnowledgeEntry,
+} from '../services/proposalService.ts';
+import {
+  createTrainingSession,
+  enqueueTrainingFileUpload,
+  getKnowledgeSourceStatus,
+  getTrainingSessionDetail,
+  listTrainingSessions,
+  processTrainingChatTurn,
+  runProactiveGapCheck,
+} from '../services/trainingStudioService.ts';
+import {
+  type AuthenticatedRequest,
   claimAdminSchema,
   claimFirstAdmin,
   clearSessionCookies,
@@ -78,6 +115,35 @@ const webhookLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+const trainingLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 35,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Training request limit reached. Please wait a moment.' },
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,
+    files: 1,
+  },
+});
+
+function toAdminActor(req: AuthenticatedRequest): AdminActor {
+  if (!req.admin || req.admin.role !== 'admin') {
+    throw new Error('Forbidden: Admin authentication required.');
+  }
+  return {
+    actorType: 'admin',
+    sub: req.admin.sub,
+    email: req.admin.email,
+    name: req.admin.name,
+    role: 'admin',
+  };
+}
 
 function timingSafeMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');
@@ -601,6 +667,533 @@ export function createApiRouter() {
         connected: false,
         error: err instanceof Error ? err.message : 'Verification failed.',
       });
+    }
+  });
+
+  // --- AI Training Studio ---
+  router.get('/training/sessions', async (req: AuthenticatedRequest, res) => {
+    try {
+      const actor = toAdminActor(req);
+      const sessions = await listTrainingSessions(actor.email);
+      res.json({ sessions });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load training sessions.' });
+    }
+  });
+
+  router.post('/training/sessions', async (req: AuthenticatedRequest, res) => {
+    const parsed = z.object({ title: z.string().trim().max(120).optional() }).safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid training session payload.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const session = await createTrainingSession({
+        title: parsed.data.title,
+        adminId: actor.sub,
+        adminEmail: actor.email,
+      });
+      res.status(201).json({ session });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create training session.' });
+    }
+  });
+
+  router.get('/training/sessions/:id', async (req: AuthenticatedRequest, res) => {
+    try {
+      const actor = toAdminActor(req);
+      const detail = await getTrainingSessionDetail(String(req.params.id));
+      if (!detail || detail.session.ownerEmail !== actor.email) {
+        res.status(404).json({ error: 'Training session not found.' });
+        return;
+      }
+      res.json(detail);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load training session.' });
+    }
+  });
+
+  router.post('/training/sessions/:id/messages', trainingLimiter, async (req: AuthenticatedRequest, res) => {
+    const parsed = z.object({ text: z.string().trim().min(1).max(4000) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Training message text is required.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const existing = await getTrainingSessionDetail(String(req.params.id));
+      if (!existing || existing.session.ownerEmail !== actor.email) {
+        res.status(404).json({ error: 'Training session not found.' });
+        return;
+      }
+      const result = await processTrainingChatTurn({
+        sessionId: existing.session._id,
+        adminId: actor.sub,
+        adminEmail: actor.email,
+        text: parsed.data.text,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to process training message.' });
+    }
+  });
+
+  router.post('/training/sessions/:id/messages/stream', trainingLimiter, async (req: AuthenticatedRequest, res) => {
+    const parsed = z.object({ text: z.string().trim().min(1).max(4000) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Training message text is required.' });
+      return;
+    }
+
+    try {
+      const actor = toAdminActor(req);
+      const existing = await getTrainingSessionDetail(String(req.params.id));
+      if (!existing || existing.session.ownerEmail !== actor.email) {
+        res.status(404).json({ error: 'Training session not found.' });
+        return;
+      }
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+
+      const writeEvent = (event: string, data: unknown) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+
+      const result = await processTrainingChatTurn({
+        sessionId: existing.session._id,
+        adminId: actor.sub,
+        adminEmail: actor.email,
+        text: parsed.data.text,
+        onToken: (delta) => writeEvent('delta', { delta }),
+      });
+
+      writeEvent('done', result);
+      res.end();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Streaming training error.';
+      if (!res.headersSent) {
+        res.status(500).json({ error: msg });
+      } else {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: msg })}\n\n`);
+        res.end();
+      }
+    }
+  });
+
+  router.post('/training/sessions/:id/gaps', trainingLimiter, async (req: AuthenticatedRequest, res) => {
+    try {
+      const actor = toAdminActor(req);
+      const existing = await getTrainingSessionDetail(String(req.params.id));
+      if (!existing || existing.session.ownerEmail !== actor.email) {
+        res.status(404).json({ error: 'Training session not found.' });
+        return;
+      }
+      const message = await runProactiveGapCheck({ sessionId: existing.session._id });
+      res.json({ message });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Gap analysis failed.' });
+    }
+  });
+
+  router.post(
+    '/training/upload',
+    trainingLimiter,
+    (req, res, next) => {
+      upload.single('file')(req, res, (err) => {
+        if (err) {
+          res.status(400).json({ error: err instanceof Error ? err.message : 'File upload error.' });
+          return;
+        }
+        next();
+      });
+    },
+    async (req: AuthenticatedRequest, res) => {
+      const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+      if (!sessionId) {
+        res.status(400).json({ error: 'sessionId is required.' });
+        return;
+      }
+      const file = req.file;
+      if (!file) {
+        res.status(400).json({ error: 'No file attached.' });
+        return;
+      }
+      try {
+        const actor = toAdminActor(req);
+        const existing = await getTrainingSessionDetail(sessionId);
+        if (!existing || existing.session.ownerEmail !== actor.email) {
+          res.status(404).json({ error: 'Training session not found.' });
+          return;
+        }
+        const source = await enqueueTrainingFileUpload({
+          sessionId,
+          filename: file.originalname,
+          mimeType: file.mimetype,
+          buffer: file.buffer,
+          adminId: actor.sub,
+          adminEmail: actor.email,
+        });
+        res.status(202).json({ source });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to process uploaded file.' });
+      }
+    },
+  );
+
+  router.get('/training/sources/:id', async (req: AuthenticatedRequest, res) => {
+    try {
+      toAdminActor(req);
+      const source = await getKnowledgeSourceStatus(String(req.params.id));
+      if (!source) {
+        res.status(404).json({ error: 'Source document not found.' });
+        return;
+      }
+      res.json({ source });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load upload status.' });
+    }
+  });
+
+  // --- Knowledge Memory (Layer A: Approved Master Memory) ---
+  router.get('/knowledge', async (req, res) => {
+    try {
+      const categoryParam =
+        typeof req.query.category === 'string' && KNOWLEDGE_CATEGORIES.includes(req.query.category as KnowledgeCategory)
+          ? (req.query.category as KnowledgeCategory)
+          : 'all';
+      const statusParam =
+        req.query.status === 'archived' || req.query.status === 'all' ? req.query.status : 'approved';
+      const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+      const entries = await listApprovedKnowledgeEntries({
+        category: categoryParam,
+        status: statusParam,
+        search,
+      });
+      res.json({ entries });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load knowledge entries.' });
+    }
+  });
+
+  router.get('/knowledge/categories', async (_req, res) => {
+    try {
+      const entries = await listApprovedKnowledgeEntries({ status: 'approved' });
+      const counts: Record<string, number> = {};
+      for (const cat of KNOWLEDGE_CATEGORIES) counts[cat] = 0;
+      for (const e of entries) {
+        counts[e.category] = (counts[e.category] ?? 0) + 1;
+      }
+      res.json({
+        categories: KNOWLEDGE_CATEGORIES.map((name) => ({
+          name,
+          count: counts[name] ?? 0,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load categories.' });
+    }
+  });
+
+  router.get('/knowledge/:id', async (req, res) => {
+    try {
+      const detail = await getKnowledgeEntryDetail(String(req.params.id));
+      if (!detail) {
+        res.status(404).json({ error: 'Knowledge entry not found.' });
+        return;
+      }
+      res.json(detail);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load knowledge entry.' });
+    }
+  });
+
+  router.get('/knowledge/:id/versions', async (req, res) => {
+    try {
+      const detail = await getKnowledgeEntryDetail(String(req.params.id));
+      if (!detail) {
+        res.status(404).json({ error: 'Knowledge entry not found.' });
+        return;
+      }
+      res.json({ versions: detail.versions });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load version history.' });
+    }
+  });
+
+  router.patch('/knowledge/:id', async (req: AuthenticatedRequest, res) => {
+    if (req.body?.actorType === 'ai') {
+      res.status(403).json({ error: 'AI agents cannot directly modify Master Memory.' });
+      return;
+    }
+    const parsed = editKnowledgeEntrySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid knowledge update payload.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const entry = await editApprovedKnowledgeEntry(String(req.params.id), parsed.data, actor);
+      res.json({ entry });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update knowledge entry.' });
+    }
+  });
+
+  router.delete('/knowledge/:id', async (req: AuthenticatedRequest, res) => {
+    if (req.body?.actorType === 'ai') {
+      res.status(403).json({ error: 'AI agents cannot directly delete Master Memory.' });
+      return;
+    }
+    const parsed = z
+      .object({
+        confirmDelete: z.literal(true),
+        entryIdConfirm: z.string().trim().min(1),
+        reason: z.string().trim().max(400).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'Explicit deletion confirmation (confirmDelete=true and matching entryIdConfirm) is required.',
+      });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const archived = await archiveKnowledgeEntry({
+        entryId: String(req.params.id),
+        actor,
+        confirmDelete: parsed.data.confirmDelete,
+        entryIdConfirm: parsed.data.entryIdConfirm,
+        reason: parsed.data.reason,
+      });
+      res.json({ entry: archived });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to archive knowledge entry.' });
+    }
+  });
+
+  router.post('/knowledge/:id/restore', async (req: AuthenticatedRequest, res) => {
+    try {
+      const actor = toAdminActor(req);
+      const restored = await restoreArchivedKnowledgeEntry(String(req.params.id), actor);
+      res.json({ entry: restored });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to restore knowledge entry.' });
+    }
+  });
+
+  // --- Proposals & Approval Workflow ---
+  router.get('/proposals', async (req, res) => {
+    try {
+      const statusParam =
+        req.query.status === 'pending_approval' ||
+        req.query.status === 'approved' ||
+        req.query.status === 'rejected' ||
+        req.query.status === 'clarification_requested'
+          ? req.query.status
+          : 'all';
+      const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+      const proposals = await listProposals({ status: statusParam, sessionId });
+      res.json({ proposals });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load proposals.' });
+    }
+  });
+
+  router.post('/proposals', async (req: AuthenticatedRequest, res) => {
+    const schema = z.object({
+      proposalType: z.enum(['knowledge', 'product']),
+      category: z.enum([
+        'Sales Behavior',
+        'Communication Rules',
+        'Customer Handling',
+        'Product Knowledge',
+        'Business Policies',
+        'Delivery Policies',
+        'Payment Policies',
+        'Warranty & Return Policies',
+        'Sales Strategies',
+        'Frequently Asked Questions',
+        'Other Business Knowledge',
+      ]),
+      title: z.string().trim().min(2).max(160),
+      description: z.string().trim().max(1200),
+      rules: z.array(z.string().trim().min(1).max(400)).min(1).max(20),
+      reason: z.string().trim().max(400).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid proposal payload.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const result = await createProposalsFromExtractedItems({
+        candidates: [
+          {
+            itemType: parsed.data.proposalType,
+            category: parsed.data.category,
+            title: parsed.data.title,
+            description: parsed.data.description,
+            rules: parsed.data.rules,
+            reason: parsed.data.reason,
+          },
+        ],
+        newSourceLabel: `Admin Proposal (${actor.email})`,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create proposal.' });
+    }
+  });
+
+  router.patch('/proposals/:id', async (req: AuthenticatedRequest, res) => {
+    if (req.body?.actorType === 'ai') {
+      res.status(403).json({ error: 'Forbidden: AI cannot edit proposal state directly.' });
+      return;
+    }
+    const parsed = editProposalSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid proposal edit.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const proposal = await editProposal(String(req.params.id), parsed.data, actor);
+      res.json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to edit proposal.' });
+    }
+  });
+
+  router.post('/proposals/:id/approve', async (req: AuthenticatedRequest, res) => {
+    if (req.body?.actorType === 'ai') {
+      res.status(403).json({ error: 'Forbidden: AI cannot self-approve proposals.' });
+      return;
+    }
+    const parsed = z
+      .object({
+        confirmDelete: z.boolean().optional(),
+        targetEntryId: z.string().trim().optional(),
+      })
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid approval options.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const result = await approveProposal(String(req.params.id), actor, parsed.data);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to approve proposal.' });
+    }
+  });
+
+  router.post('/proposals/:id/reject', async (req: AuthenticatedRequest, res) => {
+    const parsed = z.object({ reason: z.string().trim().max(400).optional() }).safeParse(req.body ?? {});
+    try {
+      const actor = toAdminActor(req);
+      const proposal = await rejectProposal(
+        String(req.params.id),
+        parsed.success ? parsed.data.reason : undefined,
+        actor,
+      );
+      res.json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to reject proposal.' });
+    }
+  });
+
+  router.post('/proposals/:id/clarify', async (req: AuthenticatedRequest, res) => {
+    const parsed = z.object({ note: z.string().trim().min(2).max(500) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Clarification note is required.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const proposal = await requestProposalClarification(String(req.params.id), parsed.data.note, actor);
+      res.json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to request clarification.' });
+    }
+  });
+
+  // --- Layer B: Short Memory Script ---
+  router.get('/memory/script', async (_req, res) => {
+    try {
+      const [activeScript, versions] = await Promise.all([
+        getActiveMemoryScript(),
+        listMemoryScriptVersions(20),
+      ]);
+      res.json({ activeScript, versions });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load Short Memory Script.' });
+    }
+  });
+
+  router.post('/memory/script/regenerate', async (req: AuthenticatedRequest, res) => {
+    const parsed = z
+      .object({ tokenBudget: z.number().int().min(200).max(2000).optional() })
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid token budget (allowed: 200-2000).' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const script = await compileShortMemoryScript({
+        tokenBudget: parsed.data.tokenBudget,
+        actorType: 'admin',
+        actorId: actor.sub,
+        actorEmail: actor.email,
+      });
+      res.json({ activeScript: script });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to regenerate script.' });
+    }
+  });
+
+  router.put('/memory/script', async (req: AuthenticatedRequest, res) => {
+    const parsed = z
+      .object({
+        scriptText: z.string().trim().min(10).max(10000),
+        tokenBudget: z.number().int().min(200).max(2000).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid Short Memory Script.' });
+      return;
+    }
+    try {
+      const actor = toAdminActor(req);
+      const script = await saveManualMemoryScriptEdit({
+        scriptText: parsed.data.scriptText,
+        tokenBudget: parsed.data.tokenBudget,
+        adminEmail: actor.email,
+        adminId: actor.sub,
+      });
+      res.json({ activeScript: script });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to save Short Memory Script.' });
+    }
+  });
+
+  // --- Audit History ---
+  router.get('/audit-logs', async (req, res) => {
+    try {
+      const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 80;
+      const logs = await listAuditLogs({ limit: Number.isFinite(limit) ? limit : 80 });
+      res.json({ logs });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load audit logs.' });
     }
   });
 

@@ -1,4 +1,6 @@
 import {
+  Brain,
+  Database,
   LayoutGrid,
   LogOut,
   MessageSquare,
@@ -21,6 +23,8 @@ interface SidebarProps {
 const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof LayoutGrid }> = [
   { id: 'overview', label: 'Overview', icon: LayoutGrid },
   { id: 'conversations', label: 'Conversations', icon: MessageSquare },
+  { id: 'training', label: 'Training Studio', icon: Brain },
+  { id: 'knowledge', label: 'Knowledge Memory', icon: Database },
   { id: 'products', label: 'Products', icon: Package },
   { id: 'orders', label: 'Orders', icon: ShoppingBag },
   { id: 'settings', label: 'Settings', icon: Settings },

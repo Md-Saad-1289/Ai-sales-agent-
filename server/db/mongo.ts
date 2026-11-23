@@ -2,14 +2,23 @@ import { randomUUID } from 'node:crypto';
 import { MongoClient, type Db, type Collection, type Document } from 'mongodb';
 import type {
   AdminUserDoc,
+  AuditLogDoc,
   ConversationDoc,
   CustomerDoc,
+  KnowledgeChunkDoc,
+  KnowledgeEntryDoc,
+  KnowledgeProposalDoc,
+  KnowledgeSourceDoc,
+  KnowledgeVersionDoc,
+  MemoryScriptDoc,
   MessageDoc,
   OrderDoc,
   ProductDoc,
   SessionDoc,
   SettingsDoc,
   SystemSecretDoc,
+  TrainingMessageDoc,
+  TrainingSessionDoc,
   WebhookEventDoc,
 } from '../types.ts';
 
@@ -434,6 +443,15 @@ export interface DatabaseCollections {
   admin_users: CollectionAdapter<AdminUserDoc>;
   sessions: CollectionAdapter<SessionDoc>;
   system_secrets: CollectionAdapter<SystemSecretDoc>;
+  training_sessions: CollectionAdapter<TrainingSessionDoc>;
+  training_messages: CollectionAdapter<TrainingMessageDoc>;
+  knowledge_entries: CollectionAdapter<KnowledgeEntryDoc>;
+  knowledge_versions: CollectionAdapter<KnowledgeVersionDoc>;
+  knowledge_proposals: CollectionAdapter<KnowledgeProposalDoc>;
+  knowledge_sources: CollectionAdapter<KnowledgeSourceDoc>;
+  knowledge_chunks: CollectionAdapter<KnowledgeChunkDoc>;
+  memory_scripts: CollectionAdapter<MemoryScriptDoc>;
+  audit_logs: CollectionAdapter<AuditLogDoc>;
 }
 
 let client: MongoClient | null = null;
@@ -624,6 +642,21 @@ async function ensureMongoIndexes(database: Db): Promise<void> {
     safeCreateIndex(database, 'sessions', { key: { userId: 1 } }),
     safeCreateIndex(database, 'sessions', { key: { expiresAt: 1 }, expireAfterSeconds: 0 }),
     safeCreateIndex(database, 'system_secrets', { key: { key: 1 }, unique: true }),
+    safeCreateIndex(database, 'training_sessions', { key: { ownerEmail: 1, updatedAt: -1 } }),
+    safeCreateIndex(database, 'training_messages', { key: { sessionId: 1, createdAt: 1 } }),
+    safeCreateIndex(database, 'knowledge_entries', { key: { status: 1, category: 1, priority: -1, updatedAt: -1 } }),
+    safeCreateIndex(database, 'knowledge_entries', { key: { stableKey: 1 } }),
+    safeCreateIndex(database, 'knowledge_entries', { key: { title: 'text', description: 'text', rules: 'text' } }),
+    safeCreateIndex(database, 'knowledge_versions', { key: { entryId: 1, version: -1 } }),
+    safeCreateIndex(database, 'knowledge_proposals', { key: { status: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'knowledge_proposals', { key: { sessionId: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'knowledge_proposals', { key: { sourceId: 1 } }),
+    safeCreateIndex(database, 'knowledge_sources', { key: { sessionId: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'knowledge_sources', { key: { sha256: 1 } }),
+    safeCreateIndex(database, 'knowledge_chunks', { key: { sourceId: 1, chunkIndex: 1 } }),
+    safeCreateIndex(database, 'memory_scripts', { key: { isActive: 1, version: -1 } }),
+    safeCreateIndex(database, 'audit_logs', { key: { createdAt: -1 } }),
+    safeCreateIndex(database, 'audit_logs', { key: { targetType: 1, targetId: 1, createdAt: -1 } }),
   ]);
 }
 
@@ -653,6 +686,15 @@ export async function initDatabase(): Promise<DatabaseCollections> {
         admin_users: new MongoCollectionWrapper<AdminUserDoc>(db.collection('admin_users')),
         sessions: new MongoCollectionWrapper<SessionDoc>(db.collection('sessions')),
         system_secrets: new MongoCollectionWrapper<SystemSecretDoc>(db.collection('system_secrets')),
+        training_sessions: new MongoCollectionWrapper<TrainingSessionDoc>(db.collection('training_sessions')),
+        training_messages: new MongoCollectionWrapper<TrainingMessageDoc>(db.collection('training_messages')),
+        knowledge_entries: new MongoCollectionWrapper<KnowledgeEntryDoc>(db.collection('knowledge_entries')),
+        knowledge_versions: new MongoCollectionWrapper<KnowledgeVersionDoc>(db.collection('knowledge_versions')),
+        knowledge_proposals: new MongoCollectionWrapper<KnowledgeProposalDoc>(db.collection('knowledge_proposals')),
+        knowledge_sources: new MongoCollectionWrapper<KnowledgeSourceDoc>(db.collection('knowledge_sources')),
+        knowledge_chunks: new MongoCollectionWrapper<KnowledgeChunkDoc>(db.collection('knowledge_chunks')),
+        memory_scripts: new MongoCollectionWrapper<MemoryScriptDoc>(db.collection('memory_scripts')),
+        audit_logs: new MongoCollectionWrapper<AuditLogDoc>(db.collection('audit_logs')),
       };
 
       await deduplicateConversationsAndCustomers(mongoCols);
@@ -685,6 +727,15 @@ export async function initDatabase(): Promise<DatabaseCollections> {
     admin_users: new MemoryCollection<AdminUserDoc>(['email']),
     sessions: new MemoryCollection<SessionDoc>(['tokenHash']),
     system_secrets: new MemoryCollection<SystemSecretDoc>(['key']),
+    training_sessions: new MemoryCollection<TrainingSessionDoc>(),
+    training_messages: new MemoryCollection<TrainingMessageDoc>(),
+    knowledge_entries: new MemoryCollection<KnowledgeEntryDoc>(),
+    knowledge_versions: new MemoryCollection<KnowledgeVersionDoc>(),
+    knowledge_proposals: new MemoryCollection<KnowledgeProposalDoc>(),
+    knowledge_sources: new MemoryCollection<KnowledgeSourceDoc>(),
+    knowledge_chunks: new MemoryCollection<KnowledgeChunkDoc>(),
+    memory_scripts: new MemoryCollection<MemoryScriptDoc>(),
+    audit_logs: new MemoryCollection<AuditLogDoc>(),
   };
   dbMode = 'memory';
   console.log('[db] Running with preview in-memory MongoDB-compatible store (set MONGODB_URI for persistent MongoDB).');

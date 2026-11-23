@@ -6,6 +6,7 @@ import express, { type Request } from 'express';
 import { closeDatabase, initDatabase } from './server/db/mongo.ts';
 import { createApiRouter, type RawBodyRequest } from './server/routes/api.ts';
 import { ensureAuthSecret } from './server/services/authService.ts';
+import { getActiveMemoryScript } from './server/services/memoryCompilerService.ts';
 import { stopRealtimeHeartbeat } from './server/services/realtimeService.ts';
 import { getSettings } from './server/services/settingsService.ts';
 import { startWebhookWorker, stopWebhookWorker } from './server/services/webhookService.ts';
@@ -18,6 +19,7 @@ async function bootstrap() {
   await initDatabase();
   await ensureAuthSecret();
   await getSettings();
+  await getActiveMemoryScript();
 
   const app = express();
   app.set('trust proxy', 1);

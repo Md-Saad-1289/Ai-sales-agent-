@@ -2,17 +2,21 @@ import { useEffect, useState } from 'react';
 import { Menu } from 'lucide-react';
 import { AuthGate } from './components/AuthGate';
 import { ConversationsPage } from './components/ConversationsPage';
+import { KnowledgeMemoryPage } from './components/KnowledgeMemoryPage';
 import { OrdersPage } from './components/OrdersPage';
 import { OverviewPage } from './components/OverviewPage';
 import { ProductsPage } from './components/ProductsPage';
 import { Sidebar } from './components/Sidebar';
 import { SettingsPage } from './components/SettingsPage';
+import { TrainingStudioPage } from './components/TrainingStudioPage';
 import { api, setUnauthorizedHandler } from './lib/api';
 import type { AdminUser, AuthBootstrapStatus, NavSection } from './types';
 
 const SECTION_TITLES: Record<NavSection, string> = {
   overview: 'Overview',
   conversations: 'Conversations',
+  training: 'Training Studio',
+  knowledge: 'Knowledge Memory',
   products: 'Products',
   orders: 'Orders',
   settings: 'Settings',
@@ -149,6 +153,8 @@ export default function App() {
           {section === 'conversations' && (
             <ConversationsPage initialConversationId={selectedConversationId} />
           )}
+          {section === 'training' && <TrainingStudioPage />}
+          {section === 'knowledge' && <KnowledgeMemoryPage />}
           {section === 'products' && <ProductsPage />}
           {section === 'orders' && <OrdersPage />}
           {section === 'settings' && <SettingsPage />}

@@ -5,7 +5,11 @@ export type RealtimeEventType =
   | 'message:created'
   | 'conversation:updated'
   | 'order:created'
-  | 'order:updated';
+  | 'order:updated'
+  | 'training:source_updated'
+  | 'training:proposal_created'
+  | 'knowledge:updated'
+  | 'memory:script_updated';
 
 interface SseClient {
   id: string;

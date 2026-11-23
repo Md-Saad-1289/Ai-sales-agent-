@@ -1,4 +1,11 @@
-export type NavSection = 'overview' | 'conversations' | 'products' | 'orders' | 'settings';
+export type NavSection =
+  | 'overview'
+  | 'conversations'
+  | 'training'
+  | 'knowledge'
+  | 'products'
+  | 'orders'
+  | 'settings';
 
 export type OrderStatus =
   | 'pending'
@@ -157,3 +164,196 @@ export interface OverviewResponse {
   recentConversations: Conversation[];
   recentOrders: Order[];
 }
+
+export type KnowledgeCategory =
+  | 'Sales Behavior'
+  | 'Communication Rules'
+  | 'Customer Handling'
+  | 'Product Knowledge'
+  | 'Business Policies'
+  | 'Delivery Policies'
+  | 'Payment Policies'
+  | 'Warranty & Return Policies'
+  | 'Sales Strategies'
+  | 'Frequently Asked Questions'
+  | 'Other Business Knowledge';
+
+export type KnowledgeClassification = 'NEW' | 'DUPLICATE' | 'MODIFIED' | 'CONFLICT' | 'UNCERTAIN';
+export type ProposalAction = 'ADD' | 'UPDATE' | 'REPLACE' | 'MERGE' | 'ARCHIVE' | 'DELETE_REQUEST';
+export type ProposalStatus = 'pending_approval' | 'approved' | 'rejected' | 'clarification_requested';
+
+export interface KnowledgeSourceRef {
+  sourceId?: string;
+  filename?: string;
+  pageOrSheet?: string;
+  sectionOrRow?: string;
+  extractedAt?: string;
+}
+
+export interface ProposalDiffItem {
+  field: string;
+  changeType: 'added' | 'removed' | 'modified' | 'unchanged';
+  oldValue?: string;
+  newValue?: string;
+}
+
+export interface KnowledgeProposal {
+  _id: string;
+  sessionId?: string;
+  messageId?: string;
+  sourceId?: string;
+  proposalType: 'knowledge' | 'product';
+  action: ProposalAction;
+  classification: KnowledgeClassification;
+  status: ProposalStatus;
+  targetEntryId?: string;
+  targetProductId?: string;
+  existingSnapshot?: Record<string, unknown>;
+  proposedEntry?: {
+    category: KnowledgeCategory;
+    title: string;
+    description: string;
+    rules: string[];
+    tags?: string[];
+    priority?: number;
+  };
+  proposedProduct?: {
+    name: string;
+    brand?: string;
+    category?: string;
+    price?: number;
+    stock?: number;
+    warranty?: string;
+    description?: string;
+    features?: string[];
+    isActive?: boolean;
+  };
+  missingFields?: string[];
+  diffSummary: ProposalDiffItem[];
+  similarityScore?: number;
+  reason: string;
+  originalSource?: string;
+  newSource: string;
+  sourceRef?: KnowledgeSourceRef;
+  clarificationNote?: string;
+  createdBy: 'ai' | 'admin';
+  reviewedBy?: string;
+  reviewedAt?: string;
+  executionResultId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeEntry {
+  _id: string;
+  stableKey: string;
+  category: KnowledgeCategory;
+  title: string;
+  description: string;
+  rules: string[];
+  tags: string[];
+  priority: number;
+  status: 'approved' | 'archived';
+  version: number;
+  currentVersionId: string;
+  source: string;
+  sourceRef?: KnowledgeSourceRef;
+  relatedIds: string[];
+  createdBy: string;
+  approvedBy: string;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+}
+
+export interface KnowledgeVersion {
+  _id: string;
+  entryId: string;
+  version: number;
+  category: KnowledgeCategory;
+  title: string;
+  description: string;
+  rules: string[];
+  source: string;
+  sourceRef?: KnowledgeSourceRef;
+  changeReason: string;
+  proposalId?: string;
+  changedBy: string;
+  action: string;
+  createdAt: string;
+}
+
+export interface KnowledgeSource {
+  _id: string;
+  sessionId?: string;
+  filename: string;
+  mimeType: string;
+  fileType: 'pdf' | 'txt' | 'csv' | 'docx' | 'xlsx';
+  sizeBytes: number;
+  status: 'queued' | 'extracting' | 'chunking' | 'analyzing' | 'completed' | 'failed';
+  totalChunks: number;
+  processedChunks: number;
+  extractedItemsCount: number;
+  proposalsCreatedCount: number;
+  duplicatesSkippedCount: number;
+  conflictsDetectedCount: number;
+  error?: string;
+  uploadedBy: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface TrainingSession {
+  _id: string;
+  title: string;
+  lastMessagePreview: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TrainingMessage {
+  _id: string;
+  sessionId: string;
+  role: 'admin' | 'ai' | 'system';
+  text: string;
+  intent?: string;
+  sourceId?: string;
+  proposalIds?: string[];
+  gapSuggestions?: Array<{
+    topic: string;
+    category: KnowledgeCategory;
+    reason: string;
+    suggestedPrompt: string;
+  }>;
+  createdAt: string;
+}
+
+export interface MemoryScript {
+  _id: string;
+  version: number;
+  scriptText: string;
+  tokenBudget: number;
+  estimatedTokens: number;
+  sourceEntryCount: number;
+  entryIdsUsed: string[];
+  isManualEdit: boolean;
+  editedBy?: string;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface AuditLog {
+  _id: string;
+  actorType: 'admin' | 'ai' | 'system';
+  actorId: string;
+  actorEmail?: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  summary: string;
+  details?: Record<string, unknown>;
+  createdAt: string;
+}
+

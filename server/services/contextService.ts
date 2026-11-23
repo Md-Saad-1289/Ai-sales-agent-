@@ -7,6 +7,11 @@ import type {
   ProductDoc,
   SettingsDoc,
 } from '../types.ts';
+import {
+  retrieveRelevantApprovedKnowledge,
+  type RetrievedKnowledgeResult,
+} from './knowledgeRetrievalService.ts';
+import { getActiveMemoryScript } from './memoryCompilerService.ts';
 import { getActiveCatalogForAI } from './productService.ts';
 import { getSettings } from './settingsService.ts';
 
@@ -17,6 +22,8 @@ export interface ConversationContextBundle {
   recentMessages: MessageDoc[];
   recentOrders: OrderDoc[];
   activeProducts: ProductDoc[];
+  shortMemoryScript: string;
+  retrievedKnowledge: RetrievedKnowledgeResult;
 }
 
 export function sanitizeUntrustedText(text: string): string {
@@ -25,6 +32,8 @@ export function sanitizeUntrustedText(text: string): string {
     .replace(/<\/?customer_message>/gi, '[message]')
     .replace(/<\/?system_instructions>/gi, '[text]')
     .replace(/<\/?verified_catalog>/gi, '[text]')
+    .replace(/<\/?short_memory_script>/gi, '[text]')
+    .replace(/<\/?relevant_approved_knowledge>/gi, '[text]')
     .trim()
     .slice(0, 2000);
 }
@@ -32,10 +41,11 @@ export function sanitizeUntrustedText(text: string): string {
 export async function buildConversationContext(params: {
   conversationId: string;
   customerId: string;
+  latestCustomerMessage?: string;
 }): Promise<ConversationContextBundle> {
   const { customers, conversations, messages, orders } = getCollections();
 
-  const [settings, customer, conversation, recentMessages, recentOrders, activeProducts] =
+  const [settings, customer, conversation, recentMessagesDesc, recentOrders, activeProducts, activeScript] =
     await Promise.all([
       getSettings(),
       customers.findOne({ _id: params.customerId }),
@@ -43,18 +53,33 @@ export async function buildConversationContext(params: {
       messages.find({ conversationId: params.conversationId }, { sort: { createdAt: -1 }, limit: 18 }),
       orders.find({ customerId: params.customerId }, { sort: { createdAt: -1 }, limit: 5 }),
       getActiveCatalogForAI(),
+      getActiveMemoryScript(),
     ]);
 
   if (!customer || !conversation) {
     throw new Error('Customer or conversation context missing.');
   }
 
+  const recentMessages = recentMessagesDesc.reverse();
+  const latestQuery =
+    params.latestCustomerMessage?.trim() ||
+    recentMessages[recentMessages.length - 1]?.text ||
+    '';
+
+  const retrievedKnowledge = await retrieveRelevantApprovedKnowledge({
+    latestMessage: latestQuery,
+    recentMessages,
+    limit: 6,
+  });
+
   return {
     settings,
     customer,
     conversation,
-    recentMessages: recentMessages.reverse(),
+    recentMessages,
     recentOrders,
     activeProducts,
+    shortMemoryScript: activeScript.scriptText,
+    retrievedKnowledge,
   };
 }

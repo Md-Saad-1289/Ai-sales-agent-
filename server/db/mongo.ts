@@ -7,7 +7,9 @@ import type {
   MessageDoc,
   OrderDoc,
   ProductDoc,
+  SessionDoc,
   SettingsDoc,
+  SystemSecretDoc,
   WebhookEventDoc,
 } from '../types.ts';
 
@@ -26,13 +28,43 @@ export interface CollectionAdapter<T extends { _id: string }> {
     update: Record<string, unknown>,
     options?: { upsert?: boolean },
   ): Promise<{ matchedCount: number; modifiedCount: number }>;
+  updateMany(
+    filter: Record<string, unknown>,
+    update: Record<string, unknown>,
+  ): Promise<{ matchedCount: number; modifiedCount: number }>;
   findOneAndUpdate(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
-    options?: { returnDocument?: 'before' | 'after' },
+    options?: { returnDocument?: 'before' | 'after'; upsert?: boolean },
   ): Promise<T | null>;
   deleteOne(filter: Record<string, unknown>): Promise<{ deletedCount: number }>;
+  deleteMany(filter: Record<string, unknown>): Promise<{ deletedCount: number }>;
   countDocuments(filter?: Record<string, unknown>): Promise<number>;
+}
+
+function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
+  const clean: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (val !== undefined) {
+      clean[key] = val;
+    }
+  }
+  return clean as T;
+}
+
+function sanitizeUpdate(update: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [op, val] of Object.entries(update)) {
+    if ((op === '$set' || op === '$setOnInsert') && val && typeof val === 'object') {
+      const cleaned = stripUndefined(val as Record<string, unknown>);
+      if (Object.keys(cleaned).length > 0) {
+        out[op] = cleaned;
+      }
+    } else {
+      out[op] = val;
+    }
+  }
+  return out;
 }
 
 function getNested(obj: unknown, path: string): unknown {
@@ -47,6 +79,7 @@ function getNested(obj: unknown, path: string): unknown {
 }
 
 function setNested(obj: Record<string, unknown>, path: string, value: unknown): void {
+  if (value === undefined) return;
   const parts = path.split('.');
   let cur = obj;
   for (let i = 0; i < parts.length - 1; i++) {
@@ -71,7 +104,11 @@ function matchesCondition(value: unknown, cond: unknown): boolean {
     if (ops.some((k) => k.startsWith('$'))) {
       for (const op of ops) {
         const target = opObj[op];
-        if (op === '$gte') {
+        if (op === '$gt') {
+          const v = value instanceof Date ? value.getTime() : Number(value);
+          const t = target instanceof Date ? target.getTime() : Number(target);
+          if (!(v > t)) return false;
+        } else if (op === '$gte') {
           const v = value instanceof Date ? value.getTime() : Number(value);
           const t = target instanceof Date ? target.getTime() : Number(target);
           if (!(v >= t)) return false;
@@ -87,6 +124,11 @@ function matchesCondition(value: unknown, cond: unknown): boolean {
           if (value === target) return false;
         } else if (op === '$in' && Array.isArray(target)) {
           if (!target.includes(value)) return false;
+        } else if (op === '$exists') {
+          const exists = value !== undefined;
+          if (Boolean(target) !== exists) return false;
+        } else if (op === '$type') {
+          if (target === 'string' && typeof value !== 'string') return false;
         } else if (op === '$regex') {
           const regex =
             target instanceof RegExp
@@ -110,6 +152,13 @@ function matchesFilter(doc: Record<string, unknown>, filter: Record<string, unkn
       if (!anyMatch) return false;
       continue;
     }
+    if (key === '$and' && Array.isArray(cond)) {
+      const allMatch = cond.every((sub) =>
+        matchesFilter(doc, sub as Record<string, unknown>),
+      );
+      if (!allMatch) return false;
+      continue;
+    }
     const val = getNested(doc, key);
     if (!matchesCondition(val, cond)) return false;
   }
@@ -119,7 +168,9 @@ function matchesFilter(doc: Record<string, unknown>, filter: Record<string, unkn
 function applyUpdate(doc: Record<string, unknown>, update: Record<string, unknown>): void {
   if (update.$set && typeof update.$set === 'object') {
     for (const [k, v] of Object.entries(update.$set as Record<string, unknown>)) {
-      setNested(doc, k, v);
+      if (v !== undefined) {
+        setNested(doc, k, v);
+      }
     }
   }
   if (update.$unset && typeof update.$unset === 'object') {
@@ -188,10 +239,11 @@ class MemoryCollection<T extends { _id: string }> implements CollectionAdapter<T
   }
 
   async insertOne(doc: Omit<T, '_id'> & { _id?: string }): Promise<T> {
-    const record = this.clone({
+    const cleanDoc = stripUndefined({
       ...doc,
       _id: doc._id ?? randomUUID(),
-    } as T);
+    });
+    const record = this.clone(cleanDoc as T);
 
     for (const field of this.uniqueFields) {
       const val = getNested(record, field);
@@ -209,6 +261,24 @@ class MemoryCollection<T extends { _id: string }> implements CollectionAdapter<T
     return this.clone(record);
   }
 
+  private buildUpsertBase(filter: Record<string, unknown>, update: Record<string, unknown>): Record<string, unknown> {
+    const base: Record<string, unknown> = { _id: randomUUID() };
+    for (const [k, v] of Object.entries(filter)) {
+      if (!k.startsWith('$') && (typeof v !== 'object' || v instanceof Date)) {
+        setNested(base, k, v);
+      }
+    }
+    if (update.$setOnInsert && typeof update.$setOnInsert === 'object') {
+      for (const [k, v] of Object.entries(update.$setOnInsert as Record<string, unknown>)) {
+        if (v !== undefined) {
+          setNested(base, k, v);
+        }
+      }
+    }
+    applyUpdate(base, update);
+    return base;
+  }
+
   async updateOne(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
@@ -217,18 +287,7 @@ class MemoryCollection<T extends { _id: string }> implements CollectionAdapter<T
     const idx = this.rows.findIndex((r) => matchesFilter(r as unknown as Record<string, unknown>, filter));
     if (idx === -1) {
       if (options.upsert) {
-        const base: Record<string, unknown> = { _id: randomUUID() };
-        for (const [k, v] of Object.entries(filter)) {
-          if (!k.startsWith('$') && (typeof v !== 'object' || v instanceof Date)) {
-            setNested(base, k, v);
-          }
-        }
-        if (update.$setOnInsert && typeof update.$setOnInsert === 'object') {
-          for (const [k, v] of Object.entries(update.$setOnInsert as Record<string, unknown>)) {
-            setNested(base, k, v);
-          }
-        }
-        applyUpdate(base, update);
+        const base = this.buildUpsertBase(filter, update);
         await this.insertOne(base as T);
         return { matchedCount: 0, modifiedCount: 1 };
       }
@@ -239,13 +298,34 @@ class MemoryCollection<T extends { _id: string }> implements CollectionAdapter<T
     return { matchedCount: 1, modifiedCount: 1 };
   }
 
+  async updateMany(
+    filter: Record<string, unknown>,
+    update: Record<string, unknown>,
+  ): Promise<{ matchedCount: number; modifiedCount: number }> {
+    let count = 0;
+    for (const row of this.rows) {
+      if (matchesFilter(row as unknown as Record<string, unknown>, filter)) {
+        applyUpdate(row as unknown as Record<string, unknown>, update);
+        count++;
+      }
+    }
+    return { matchedCount: count, modifiedCount: count };
+  }
+
   async findOneAndUpdate(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
-    options: { returnDocument?: 'before' | 'after' } = {},
+    options: { returnDocument?: 'before' | 'after'; upsert?: boolean } = {},
   ): Promise<T | null> {
     const idx = this.rows.findIndex((r) => matchesFilter(r as unknown as Record<string, unknown>, filter));
-    if (idx === -1) return null;
+    if (idx === -1) {
+      if (options.upsert) {
+        const base = this.buildUpsertBase(filter, update);
+        const inserted = await this.insertOne(base as T);
+        return options.returnDocument === 'before' ? null : inserted;
+      }
+      return null;
+    }
     const before = this.clone(this.rows[idx]);
     applyUpdate(this.rows[idx] as unknown as Record<string, unknown>, update);
     return options.returnDocument === 'before' ? before : this.clone(this.rows[idx]);
@@ -256,6 +336,12 @@ class MemoryCollection<T extends { _id: string }> implements CollectionAdapter<T
     if (idx === -1) return { deletedCount: 0 };
     this.rows.splice(idx, 1);
     return { deletedCount: 1 };
+  }
+
+  async deleteMany(filter: Record<string, unknown>): Promise<{ deletedCount: number }> {
+    const prevLen = this.rows.length;
+    this.rows = this.rows.filter((r) => !matchesFilter(r as unknown as Record<string, unknown>, filter));
+    return { deletedCount: prevLen - this.rows.length };
   }
 
   async countDocuments(filter: Record<string, unknown> = {}): Promise<number> {
@@ -285,10 +371,10 @@ class MongoCollectionWrapper<T extends { _id: string }> implements CollectionAda
   }
 
   async insertOne(doc: Omit<T, '_id'> & { _id?: string }): Promise<T> {
-    const record = {
+    const record = stripUndefined({
       ...doc,
       _id: doc._id ?? randomUUID(),
-    };
+    });
     await this.col.insertOne(record as unknown as Document);
     return record as unknown as T;
   }
@@ -298,23 +384,37 @@ class MongoCollectionWrapper<T extends { _id: string }> implements CollectionAda
     update: Record<string, unknown>,
     options: { upsert?: boolean } = {},
   ): Promise<{ matchedCount: number; modifiedCount: number }> {
-    const res = await this.col.updateOne(filter, update, options);
+    const res = await this.col.updateOne(filter, sanitizeUpdate(update), options);
+    return { matchedCount: res.matchedCount, modifiedCount: res.modifiedCount };
+  }
+
+  async updateMany(
+    filter: Record<string, unknown>,
+    update: Record<string, unknown>,
+  ): Promise<{ matchedCount: number; modifiedCount: number }> {
+    const res = await this.col.updateMany(filter, sanitizeUpdate(update));
     return { matchedCount: res.matchedCount, modifiedCount: res.modifiedCount };
   }
 
   async findOneAndUpdate(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
-    options: { returnDocument?: 'before' | 'after' } = {},
+    options: { returnDocument?: 'before' | 'after'; upsert?: boolean } = {},
   ): Promise<T | null> {
-    const doc = await this.col.findOneAndUpdate(filter, update, {
+    const doc = await this.col.findOneAndUpdate(filter, sanitizeUpdate(update), {
       returnDocument: options.returnDocument ?? 'after',
+      upsert: options.upsert,
     });
     return (doc as unknown as T) ?? null;
   }
 
   async deleteOne(filter: Record<string, unknown>): Promise<{ deletedCount: number }> {
     const res = await this.col.deleteOne(filter);
+    return { deletedCount: res.deletedCount };
+  }
+
+  async deleteMany(filter: Record<string, unknown>): Promise<{ deletedCount: number }> {
+    const res = await this.col.deleteMany(filter);
     return { deletedCount: res.deletedCount };
   }
 
@@ -332,6 +432,8 @@ export interface DatabaseCollections {
   settings: CollectionAdapter<SettingsDoc>;
   webhook_events: CollectionAdapter<WebhookEventDoc>;
   admin_users: CollectionAdapter<AdminUserDoc>;
+  sessions: CollectionAdapter<SessionDoc>;
+  system_secrets: CollectionAdapter<SystemSecretDoc>;
 }
 
 let client: MongoClient | null = null;
@@ -340,38 +442,153 @@ let collections: DatabaseCollections | null = null;
 let dbMode: 'mongodb' | 'memory' = 'memory';
 let dbConnectionError: string | null = null;
 
+async function safeCreateIndex(
+  database: Db,
+  collectionName: string,
+  spec: { key: Record<string, 1 | -1 | 'text'>; unique?: boolean; sparse?: boolean; partialFilterExpression?: Record<string, unknown>; expireAfterSeconds?: number },
+): Promise<void> {
+  try {
+    await database.collection(collectionName).createIndex(spec.key, {
+      unique: spec.unique,
+      sparse: spec.sparse,
+      partialFilterExpression: spec.partialFilterExpression,
+      expireAfterSeconds: spec.expireAfterSeconds,
+    });
+  } catch (err) {
+    console.warn(
+      `[db] Index check warning on ${collectionName}:`,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+async function migrateMessagesIndexesAndNulls(database: Db): Promise<void> {
+  const messagesCol = database.collection('messages');
+  try {
+    await messagesCol.updateMany(
+      { externalMessageId: null },
+      { $unset: { externalMessageId: '' } },
+    );
+  } catch (err) {
+    console.warn('[db] Message null externalMessageId cleanup warning:', err instanceof Error ? err.message : String(err));
+  }
+
+  try {
+    const indexes = await messagesCol.indexes();
+    const legacyExtIdx = indexes.find(
+      (idx) => idx.name === 'externalMessageId_1' && !idx.partialFilterExpression,
+    );
+    if (legacyExtIdx) {
+      await messagesCol.dropIndex('externalMessageId_1');
+    }
+  } catch (err) {
+    console.warn('[db] Legacy externalMessageId index migration warning:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function deduplicateConversationsAndCustomers(cols: DatabaseCollections): Promise<void> {
+  try {
+    const allConvs = await cols.conversations.find({}, { sort: { lastMessageAt: -1 } });
+    const byMessenger = new Map<string, ConversationDoc[]>();
+    for (const conv of allConvs) {
+      const list = byMessenger.get(conv.messengerId) ?? [];
+      list.push(conv);
+      byMessenger.set(conv.messengerId, list);
+    }
+
+    for (const [messengerId, list] of byMessenger.entries()) {
+      if (list.length <= 1) continue;
+
+      // Prefer conversation that has messages / non-empty lastMessageText, then most recent
+      const ranked = [...list].sort((a, b) => {
+        const aHasMsg = a.lastMessageText.trim().length > 0 ? 1 : 0;
+        const bHasMsg = b.lastMessageText.trim().length > 0 ? 1 : 0;
+        if (aHasMsg !== bHasMsg) return bHasMsg - aHasMsg;
+        return new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime();
+      });
+
+      const primary = ranked[0];
+      for (const secondary of ranked.slice(1)) {
+        await cols.messages.updateMany(
+          { conversationId: secondary._id },
+          {
+            $set: {
+              conversationId: primary._id,
+              conversation_id: primary._id,
+              customerId: primary.customerId,
+              customer_id: primary.customerId,
+            },
+          },
+        );
+        await cols.orders.updateMany(
+          { conversationId: secondary._id },
+          {
+            $set: {
+              conversationId: primary._id,
+              customerId: primary.customerId,
+            },
+          },
+        );
+        await cols.conversations.deleteOne({ _id: secondary._id });
+      }
+
+      // Recompute latest message summary on primary after merge
+      const latestMsgs = await cols.messages.find(
+        { conversationId: primary._id },
+        { sort: { createdAt: -1 }, limit: 1 },
+      );
+      if (latestMsgs[0]) {
+        const m = latestMsgs[0];
+        await cols.conversations.updateOne(
+          { _id: primary._id },
+          {
+            $set: {
+              lastMessageText: (m.text || m.message_text || '').slice(0, 240),
+              lastMessageSender: m.sender || m.sender_type,
+              lastMessageAt: m.createdAt || m.timestamp,
+              updatedAt: new Date(),
+            },
+          },
+        );
+      }
+      console.log(`[db] Deduplicated ${list.length - 1} duplicate conversation(s) for PSID ${messengerId}`);
+    }
+  } catch (err) {
+    console.warn('[db] Duplicate conversation cleanup warning:', err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function ensureMongoIndexes(database: Db): Promise<void> {
+  await migrateMessagesIndexesAndNulls(database);
+
   await Promise.all([
-    database.collection('products').createIndexes([
-      { key: { isActive: 1, updatedAt: -1 } },
-      { key: { name: 'text', description: 'text' } },
-    ]),
-    database.collection('customers').createIndexes([
-      { key: { messengerId: 1 }, unique: true },
-      { key: { updatedAt: -1 } },
-    ]),
-    database.collection('conversations').createIndexes([
-      { key: { messengerId: 1 }, unique: true },
-      { key: { customerId: 1 } },
-      { key: { lastMessageAt: -1 } },
-      { key: { humanTakeover: 1, aiEnabled: 1 } },
-    ]),
-    database.collection('messages').createIndexes([
-      { key: { conversationId: 1, createdAt: 1 } },
-      { key: { externalMessageId: 1 }, unique: true, sparse: true },
-    ]),
-    database.collection('orders').createIndexes([
-      { key: { orderNumber: 1 }, unique: true },
-      { key: { idempotencyKey: 1 }, unique: true, sparse: true },
-      { key: { customerId: 1, createdAt: -1 } },
-      { key: { status: 1, createdAt: -1 } },
-    ]),
-    database.collection('settings').createIndex({ key: 1 }, { unique: true }),
-    database.collection('webhook_events').createIndexes([
-      { key: { eventId: 1 }, unique: true },
-      { key: { status: 1, nextRetryAt: 1 } },
-    ]),
-    database.collection('admin_users').createIndex({ email: 1 }, { unique: true }),
+    safeCreateIndex(database, 'products', { key: { isActive: 1, updatedAt: -1 } }),
+    safeCreateIndex(database, 'products', { key: { name: 'text', description: 'text' } }),
+    safeCreateIndex(database, 'customers', { key: { messengerId: 1 }, unique: true }),
+    safeCreateIndex(database, 'customers', { key: { updatedAt: -1 } }),
+    safeCreateIndex(database, 'conversations', { key: { messengerId: 1 }, unique: true }),
+    safeCreateIndex(database, 'conversations', { key: { customerId: 1 } }),
+    safeCreateIndex(database, 'conversations', { key: { lastMessageAt: -1 } }),
+    safeCreateIndex(database, 'conversations', { key: { humanTakeover: 1, aiEnabled: 1 } }),
+    safeCreateIndex(database, 'messages', { key: { conversationId: 1, createdAt: 1 } }),
+    safeCreateIndex(database, 'messages', { key: { conversationId: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'messages', {
+      key: { externalMessageId: 1 },
+      unique: true,
+      partialFilterExpression: { externalMessageId: { $type: 'string' } },
+    }),
+    safeCreateIndex(database, 'orders', { key: { orderNumber: 1 }, unique: true }),
+    safeCreateIndex(database, 'orders', { key: { idempotencyKey: 1 }, unique: true, sparse: true }),
+    safeCreateIndex(database, 'orders', { key: { customerId: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'orders', { key: { status: 1, createdAt: -1 } }),
+    safeCreateIndex(database, 'settings', { key: { key: 1 }, unique: true }),
+    safeCreateIndex(database, 'webhook_events', { key: { eventId: 1 }, unique: true }),
+    safeCreateIndex(database, 'webhook_events', { key: { status: 1, nextRetryAt: 1 } }),
+    safeCreateIndex(database, 'admin_users', { key: { email: 1 }, unique: true }),
+    safeCreateIndex(database, 'sessions', { key: { tokenHash: 1 }, unique: true }),
+    safeCreateIndex(database, 'sessions', { key: { userId: 1 } }),
+    safeCreateIndex(database, 'sessions', { key: { expiresAt: 1 }, expireAfterSeconds: 0 }),
+    safeCreateIndex(database, 'system_secrets', { key: { key: 1 }, unique: true }),
   ]);
 }
 
@@ -389,9 +606,8 @@ export async function initDatabase(): Promise<DatabaseCollections> {
       await client.connect();
       db = client.db(dbName);
       await db.command({ ping: 1 });
-      await ensureMongoIndexes(db);
 
-      collections = {
+      const mongoCols: DatabaseCollections = {
         products: new MongoCollectionWrapper<ProductDoc>(db.collection('products')),
         customers: new MongoCollectionWrapper<CustomerDoc>(db.collection('customers')),
         conversations: new MongoCollectionWrapper<ConversationDoc>(db.collection('conversations')),
@@ -400,7 +616,14 @@ export async function initDatabase(): Promise<DatabaseCollections> {
         settings: new MongoCollectionWrapper<SettingsDoc>(db.collection('settings')),
         webhook_events: new MongoCollectionWrapper<WebhookEventDoc>(db.collection('webhook_events')),
         admin_users: new MongoCollectionWrapper<AdminUserDoc>(db.collection('admin_users')),
+        sessions: new MongoCollectionWrapper<SessionDoc>(db.collection('sessions')),
+        system_secrets: new MongoCollectionWrapper<SystemSecretDoc>(db.collection('system_secrets')),
       };
+
+      await deduplicateConversationsAndCustomers(mongoCols);
+      await ensureMongoIndexes(db);
+
+      collections = mongoCols;
       dbMode = 'mongodb';
       dbConnectionError = null;
       console.log(`[db] Connected to MongoDB database "${dbName}" with verified indexes.`);
@@ -425,6 +648,8 @@ export async function initDatabase(): Promise<DatabaseCollections> {
     settings: new MemoryCollection<SettingsDoc>(['key']),
     webhook_events: new MemoryCollection<WebhookEventDoc>(['eventId']),
     admin_users: new MemoryCollection<AdminUserDoc>(['email']),
+    sessions: new MemoryCollection<SessionDoc>(['tokenHash']),
+    system_secrets: new MemoryCollection<SystemSecretDoc>(['key']),
   };
   dbMode = 'memory';
   console.log('[db] Running with preview in-memory MongoDB-compatible store (set MONGODB_URI for persistent MongoDB).');

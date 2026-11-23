@@ -28,6 +28,7 @@ export interface ProductDoc {
 export interface CustomerDoc {
   _id: string;
   messengerId: string;
+  pageId?: string;
   name: string;
   profilePic?: string;
   phone?: string;
@@ -54,6 +55,7 @@ export interface ConversationDoc {
   _id: string;
   customerId: string;
   messengerId: string;
+  pageId?: string;
   customerName: string;
   aiEnabled: boolean;
   humanTakeover: boolean;
@@ -68,16 +70,25 @@ export interface ConversationDoc {
   updatedAt: Date;
 }
 
+export type MessageSource = 'messenger' | 'dashboard';
+
 export interface MessageDoc {
   _id: string;
+  message_id: string;
   conversationId: string;
+  conversation_id: string;
   customerId: string;
+  customer_id: string;
   messengerId: string;
   sender: MessageSender;
+  sender_type: MessageSender;
   text: string;
+  message_text: string;
   externalMessageId?: string;
   deliveryStatus: 'received' | 'sent' | 'failed' | 'simulated';
+  delivery_status: 'received' | 'sent' | 'failed' | 'simulated';
   deliveryError?: string;
+  source: MessageSource;
   aiMetadata?: {
     intent?: string;
     action?: string;
@@ -85,6 +96,7 @@ export interface MessageDoc {
     recommendedProductIds?: string[];
   };
   createdAt: Date;
+  timestamp: Date;
 }
 
 export interface OrderItemDoc {
@@ -159,6 +171,27 @@ export interface AdminUserDoc {
   name: string;
   passwordHash: string;
   role: 'admin';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SessionDoc {
+  _id: string;
+  tokenHash: string;
+  userId: string;
+  email: string;
+  name: string;
+  role: 'admin';
+  expiresAt: Date;
+  revokedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SystemSecretDoc {
+  _id: string;
+  key: string;
+  value: string;
   createdAt: Date;
   updatedAt: Date;
 }

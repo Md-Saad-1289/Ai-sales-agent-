@@ -6,11 +6,17 @@ import { getCollections } from '../db/mongo.ts';
 import {
   claimAdminSchema,
   claimFirstAdmin,
+  clearSessionCookies,
   getAuthBootstrapStatus,
+  getRefreshCookieName,
   loginAdmin,
   loginSchema,
+  parseCookies,
   requireAdmin,
-  type AuthenticatedRequest,
+  resolveOrRefreshAdmin,
+  revokeSessionFromRequest,
+  rotateRefreshSession,
+  setSessionCookies,
 } from '../services/authService.ts';
 import {
   addMessage,
@@ -35,6 +41,7 @@ import {
   productInputSchema,
   updateProduct,
 } from '../services/productService.ts';
+import { attachSseClient } from '../services/realtimeService.ts';
 import {
   getEnvironmentStatus,
   getSettings,
@@ -137,7 +144,8 @@ export function createApiRouter() {
     }
     try {
       const result = await claimFirstAdmin(parsed.data);
-      res.status(201).json(result);
+      setSessionCookies(req, res, result.accessToken, result.refreshToken);
+      res.status(201).json({ admin: result.admin });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Setup failed.' });
     }
@@ -151,18 +159,71 @@ export function createApiRouter() {
     }
     try {
       const result = await loginAdmin(parsed.data);
-      res.json(result);
+      setSessionCookies(req, res, result.accessToken, result.refreshToken);
+      res.json({ admin: result.admin });
     } catch (err) {
       res.status(401).json({ error: err instanceof Error ? err.message : 'Login failed.' });
     }
   });
 
+  router.post('/auth/refresh', authLimiter, async (req, res) => {
+    try {
+      const cookies = parseCookies(req);
+      const rawRefresh = cookies[getRefreshCookieName()];
+      if (!rawRefresh) {
+        clearSessionCookies(req, res);
+        res.status(401).json({ error: 'Refresh session not found.' });
+        return;
+      }
+      const rotated = await rotateRefreshSession(rawRefresh);
+      if (!rotated) {
+        clearSessionCookies(req, res);
+        res.status(401).json({ error: 'Refresh session expired or revoked.' });
+        return;
+      }
+      setSessionCookies(req, res, rotated.accessToken, rotated.refreshToken);
+      res.json({ admin: rotated.admin });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to refresh session.' });
+    }
+  });
+
+  router.post('/auth/logout', async (req, res) => {
+    try {
+      await revokeSessionFromRequest(req);
+    } catch {
+      // Ignore cleanup errors on logout
+    }
+    clearSessionCookies(req, res);
+    res.json({ ok: true });
+  });
+
+  router.get('/auth/me', async (req, res) => {
+    try {
+      const payload = await resolveOrRefreshAdmin(req, res);
+      if (!payload) {
+        res.status(401).json({ error: 'Authentication required.' });
+        return;
+      }
+      res.json({
+        admin: {
+          email: payload.email,
+          name: payload.name,
+          role: payload.role,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to verify session.' });
+    }
+  });
+
+  // Realtime Server-Sent Events Stream (exempt from short API rate limiter)
+  router.get('/events/stream', requireAdmin, (req, res) => {
+    attachSseClient(req, res);
+  });
+
   // --- Authenticated Admin Endpoints ---
   router.use(apiLimiter, requireAdmin);
-
-  router.get('/auth/me', (req: AuthenticatedRequest, res) => {
-    res.json({ admin: req.admin });
-  });
 
   // Overview
   router.get('/overview', async (_req, res) => {
@@ -283,16 +344,25 @@ export function createApiRouter() {
         res.status(404).json({ error: 'Conversation not found.' });
         return;
       }
-      await markConversationRead(conversation._id);
-      const [messages, customerProfile] = await Promise.all([
-        getConversationMessages(conversation._id),
+      const limitParam = typeof req.query.limit === 'string' ? Number(req.query.limit) : 100;
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 100;
+      const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+
+      if (!before) {
+        await markConversationRead(conversation._id);
+      }
+
+      const [msgPage, customerProfile] = await Promise.all([
+        getConversationMessages(conversation._id, { limit, before }),
         getCustomerProfileWithOrders(conversation.customerId),
       ]);
 
       res.json({
-        conversation: { ...conversation, unreadCount: 0 },
+        conversation: before ? conversation : { ...conversation, unreadCount: 0 },
         withinMessagingWindow: isWithinMessagingWindow(conversation.lastCustomerMessageAt),
-        messages,
+        messages: msgPage.messages,
+        hasMore: msgPage.hasMore,
+        nextCursor: msgPage.nextCursor,
         customer: customerProfile.customer,
         customerOrders: customerProfile.orders,
       });
@@ -394,6 +464,7 @@ export function createApiRouter() {
         externalMessageId,
         deliveryStatus,
         deliveryError,
+        source: 'dashboard',
       });
 
       const refreshed = await getConversationById(conversation._id);

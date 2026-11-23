@@ -50,6 +50,7 @@ export interface Conversation {
   _id: string;
   customerId: string;
   messengerId: string;
+  pageId?: string;
   customerName: string;
   aiEnabled: boolean;
   humanTakeover: boolean;
@@ -63,11 +64,19 @@ export interface Conversation {
 
 export interface Message {
   _id: string;
+  message_id?: string;
   conversationId: string;
+  conversation_id?: string;
+  customerId?: string;
+  customer_id?: string;
   sender: 'customer' | 'ai' | 'admin';
+  sender_type?: 'customer' | 'ai' | 'admin';
   text: string;
+  message_text?: string;
   deliveryStatus: 'received' | 'sent' | 'failed' | 'simulated';
+  delivery_status?: 'received' | 'sent' | 'failed' | 'simulated';
   deliveryError?: string;
+  source?: 'messenger' | 'dashboard';
   aiMetadata?: {
     intent?: string;
     action?: string;
@@ -75,6 +84,7 @@ export interface Message {
     recommendedProductIds?: string[];
   };
   createdAt: string;
+  timestamp?: string;
 }
 
 export interface OrderItem {

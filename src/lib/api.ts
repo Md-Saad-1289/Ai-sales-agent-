@@ -12,31 +12,62 @@ import type {
   Settings,
 } from '../types';
 
-let inMemoryToken: string | null = null;
 let onUnauthorizedHandler: (() => void) | null = null;
-
-export function setAuthToken(token: string | null): void {
-  inMemoryToken = token;
-}
-
-export function getAuthToken(): string | null {
-  return inMemoryToken;
-}
+let refreshInFlight: Promise<boolean> | null = null;
 
 export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorizedHandler = handler;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function refreshSession(): Promise<boolean> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const res = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'X-Requested-With': 'PageFlowUI',
+        },
+      });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
+}
+
+async function request<T>(path: string, init: RequestInit = {}, allowRetry = true): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body) {
     headers.set('Content-Type', 'application/json');
   }
-  if (inMemoryToken) {
-    headers.set('Authorization', `Bearer ${inMemoryToken}`);
+  headers.set('X-Requested-With', 'PageFlowUI');
+
+  const res = await fetch(path, {
+    ...init,
+    headers,
+    credentials: 'include',
+  });
+
+  const isAuthEndpoint =
+    path.startsWith('/api/auth/login') ||
+    path.startsWith('/api/auth/claim') ||
+    path.startsWith('/api/auth/refresh') ||
+    path.startsWith('/api/auth/me') ||
+    path.startsWith('/api/auth/status');
+
+  if (res.status === 401 && allowRetry && !isAuthEndpoint) {
+    const refreshed = await refreshSession();
+    if (refreshed) {
+      return request<T>(path, init, false);
+    }
+    onUnauthorizedHandler?.();
   }
 
-  const res = await fetch(path, { ...init, headers });
   const text = await res.text();
   let data: unknown = {};
   if (text) {
@@ -45,11 +76,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       data = { error: text };
     }
-  }
-
-  if (res.status === 401 && inMemoryToken) {
-    inMemoryToken = null;
-    onUnauthorizedHandler?.();
   }
 
   if (!res.ok) {
@@ -63,17 +89,138 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
+export interface RealtimeHandlers {
+  onMessageCreated?: (payload: {
+    conversationId: string;
+    message: Message;
+    conversation?: Conversation;
+  }) => void;
+  onConversationUpdated?: (payload: { conversation: Conversation }) => void;
+  onOrderCreated?: (payload: { order: Order }) => void;
+  onOrderUpdated?: (payload: { order: Order }) => void;
+  onReconnect?: () => void;
+}
+
+export function subscribeRealtimeEvents(handlers: RealtimeHandlers): () => void {
+  if (typeof EventSource === 'undefined') {
+    return () => undefined;
+  }
+
+  let es: EventSource | null = null;
+  let closed = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let hadDisconnect = false;
+
+  const connect = () => {
+    if (closed) return;
+    es = new EventSource('/api/events/stream', { withCredentials: true });
+
+    es.onopen = () => {
+      if (hadDisconnect) {
+        hadDisconnect = false;
+        handlers.onReconnect?.();
+      }
+    };
+
+    es.addEventListener('message:created', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as {
+          conversationId: string;
+          message: Message;
+          conversation?: Conversation;
+        };
+        handlers.onMessageCreated?.(data);
+      } catch {
+        // Ignore malformed event payload
+      }
+    });
+
+    es.addEventListener('conversation:updated', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { conversation: Conversation };
+        handlers.onConversationUpdated?.(data);
+      } catch {
+        // Ignore malformed event payload
+      }
+    });
+
+    es.addEventListener('order:created', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { order: Order };
+        handlers.onOrderCreated?.(data);
+      } catch {
+        // Ignore malformed event payload
+      }
+    });
+
+    es.addEventListener('order:updated', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { order: Order };
+        handlers.onOrderUpdated?.(data);
+      } catch {
+        // Ignore malformed event payload
+      }
+    });
+
+    es.onerror = () => {
+      hadDisconnect = true;
+      es?.close();
+      es = null;
+      if (!closed && !reconnectTimer) {
+        reconnectTimer = setTimeout(async () => {
+          reconnectTimer = null;
+          if (closed) return;
+          // Refresh access cookie if SSE disconnected because access token expired
+          await refreshSession();
+          connect();
+        }, 3000);
+      }
+    };
+  };
+
+  connect();
+
+  return () => {
+    closed = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    es?.close();
+    es = null;
+  };
+}
+
 export const api = {
   getAuthStatus: () => request<AuthBootstrapStatus>('/api/auth/status'),
+  getMe: async (): Promise<AdminUser | null> => {
+    const res = await fetch('/api/auth/me', {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        'X-Requested-With': 'PageFlowUI',
+      },
+    });
+    if (res.status === 401) return null;
+    if (!res.ok) {
+      throw new Error(`Session check failed (${res.status})`);
+    }
+    const data = (await res.json()) as { admin?: AdminUser };
+    return data.admin ?? null;
+  },
   claimAdmin: (body: { email: string; name: string; password: string }) =>
-    request<{ token: string; admin: AdminUser }>('/api/auth/claim', {
+    request<{ admin: AdminUser }>('/api/auth/claim', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   login: (body: { email?: string; password: string }) =>
-    request<{ token: string; admin: AdminUser }>('/api/auth/login', {
+    request<{ admin: AdminUser }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  logout: () =>
+    request<{ ok: boolean }>('/api/auth/logout', {
+      method: 'POST',
     }),
   getOverview: () => request<OverviewResponse>('/api/overview'),
   listProducts: (params?: { search?: string; activeOnly?: boolean }) => {
@@ -104,14 +251,21 @@ export const api = {
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return request<{ conversations: Conversation[] }>(`/api/conversations${suffix}`);
   },
-  getConversationDetail: (id: string) =>
-    request<{
+  getConversationDetail: (id: string, opts?: { limit?: number; before?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.limit) qs.set('limit', String(opts.limit));
+    if (opts?.before) qs.set('before', opts.before);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return request<{
       conversation: Conversation;
       withinMessagingWindow: boolean;
       messages: Message[];
+      hasMore: boolean;
+      nextCursor: string | null;
       customer: Customer | null;
       customerOrders: Order[];
-    }>(`/api/conversations/${encodeURIComponent(id)}`),
+    }>(`/api/conversations/${encodeURIComponent(id)}${suffix}`);
+  },
   toggleConversationAI: (id: string, body: { aiEnabled: boolean; humanTakeover?: boolean }) =>
     request<{ conversation: Conversation }>(`/api/conversations/${encodeURIComponent(id)}/ai`, {
       method: 'PATCH',

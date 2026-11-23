@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ArrowRight,
   Bot,
@@ -7,7 +7,7 @@ import {
   MessageSquare,
   Package,
 } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, subscribeRealtimeEvents } from '../lib/api';
 import type { NavSection, OverviewResponse } from '../types';
 
 interface OverviewPageProps {
@@ -30,22 +30,45 @@ export function OverviewPage({ onNavigate }: OverviewPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  async function loadOverview() {
-    setLoading(true);
-    setError(null);
+  const loadOverview = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     try {
       const res = await api.getOverview();
       setData(res);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load overview.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Failed to load overview.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
-  }
+  }, []);
 
   useEffect(() => {
-    void loadOverview();
-  }, []);
+    void loadOverview(false);
+    const unsubscribe = subscribeRealtimeEvents({
+      onMessageCreated: () => void loadOverview(true),
+      onConversationUpdated: () => void loadOverview(true),
+      onOrderCreated: () => void loadOverview(true),
+      onOrderUpdated: () => void loadOverview(true),
+      onReconnect: () => void loadOverview(true),
+    });
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadOverview(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [loadOverview]);
 
   if (loading) {
     return (

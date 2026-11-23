@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Search, ShoppingBag, X } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, subscribeRealtimeEvents } from '../lib/api';
 import type { Order, OrderStatus } from '../types';
 
 const STATUS_OPTIONS: OrderStatus[] = [
@@ -36,23 +36,49 @@ export function OrdersPage() {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  async function loadOrders() {
-    setLoading(true);
-    setError(null);
+  const loadOrders = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     try {
       const [ordRes, setRes] = await Promise.all([api.listOrders(), api.getSettings()]);
       setOrders(ordRes.orders);
       setCurrency(setRes.settings.currency || 'BDT');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load orders.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Failed to load orders.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
-  }
+  }, []);
 
   useEffect(() => {
-    void loadOrders();
-  }, []);
+    void loadOrders(false);
+    const unsubscribe = subscribeRealtimeEvents({
+      onOrderCreated: ({ order }) => {
+        setOrders((prev) => (prev.some((o) => o._id === order._id) ? prev : [order, ...prev]));
+      },
+      onOrderUpdated: ({ order }) => {
+        setOrders((prev) => prev.map((o) => (o._id === order._id ? order : o)));
+        setSelectedOrder((prev) => (prev?._id === order._id ? order : prev));
+      },
+      onReconnect: () => void loadOrders(true),
+    });
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadOrders(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [loadOrders]);
 
   async function handleStatusChange(orderId: string, nextStatus: OrderStatus) {
     setUpdatingId(orderId);

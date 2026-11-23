@@ -7,7 +7,7 @@ import { OverviewPage } from './components/OverviewPage';
 import { ProductsPage } from './components/ProductsPage';
 import { Sidebar } from './components/Sidebar';
 import { SettingsPage } from './components/SettingsPage';
-import { api, setAuthToken, setUnauthorizedHandler } from './lib/api';
+import { api, setUnauthorizedHandler } from './lib/api';
 import type { AdminUser, AuthBootstrapStatus, NavSection } from './types';
 
 const SECTION_TITLES: Record<NavSection, string> = {
@@ -22,27 +22,41 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthBootstrapStatus | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [admin, setAdmin] = useState<AdminUser | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
 
   const [section, setSection] = useState<NavSection>('overview');
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  async function checkBootstrap() {
+  async function checkBootstrap(verifySession = true) {
     setAuthError(null);
+    if (verifySession) {
+      setCheckingSession(true);
+    }
     try {
-      const status = await api.getAuthStatus();
-      setAuthStatus(status);
+      if (verifySession) {
+        const [status, currentAdmin] = await Promise.all([api.getAuthStatus(), api.getMe()]);
+        setAuthStatus(status);
+        setAdmin(currentAdmin);
+      } else {
+        const status = await api.getAuthStatus();
+        setAuthStatus(status);
+      }
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : 'Unable to reach server.');
+    } finally {
+      if (verifySession) {
+        setCheckingSession(false);
+      }
     }
   }
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
       setAdmin(null);
-      void checkBootstrap();
+      void checkBootstrap(false);
     });
-    void checkBootstrap();
+    void checkBootstrap(true);
   }, []);
 
   function handleNavigate(next: NavSection, conversationId?: string) {
@@ -52,10 +66,14 @@ export default function App() {
     }
   }
 
-  function handleSignOut() {
-    setAuthToken(null);
+  async function handleSignOut() {
+    try {
+      await api.logout();
+    } catch {
+      // Clear local session state even if network request fails
+    }
     setAdmin(null);
-    void checkBootstrap();
+    await checkBootstrap(false);
   }
 
   if (authError) {
@@ -65,7 +83,7 @@ export default function App() {
           <p className="text-sm text-red-700">{authError}</p>
           <button
             type="button"
-            onClick={() => void checkBootstrap()}
+            onClick={() => void checkBootstrap(true)}
             className="px-4 py-2 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
           >
             Retry
@@ -75,7 +93,7 @@ export default function App() {
     );
   }
 
-  if (!authStatus) {
+  if (checkingSession || !authStatus) {
     return (
       <div className="min-h-screen bg-[#f8fafc] flex items-center justify-center">
         <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />

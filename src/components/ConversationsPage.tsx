@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   ArrowLeft,
   Bot,
@@ -10,7 +10,7 @@ import {
   UserCheck,
   X,
 } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, subscribeRealtimeEvents } from '../lib/api';
 import type { Conversation, Customer, Message, Order } from '../types';
 
 interface ConversationsPageProps {
@@ -30,6 +30,24 @@ function getInitials(name: string): string {
   return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
 }
 
+function upsertSortedConversation(list: Conversation[], updated: Conversation): Conversation[] {
+  const idx = list.findIndex((c) => c._id === updated._id);
+  const next = idx === -1 ? [updated, ...list] : list.map((c) => (c._id === updated._id ? updated : c));
+  return [...next].sort(
+    (a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime(),
+  );
+}
+
+function mergeMessageUnique(list: Message[], incoming: Message): Message[] {
+  const incomingId = incoming.message_id || incoming._id;
+  if (list.some((m) => (m.message_id || m._id) === incomingId)) {
+    return list.map((m) => ((m.message_id || m._id) === incomingId ? incoming : m));
+  }
+  return [...list, incoming].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
+}
+
 export function ConversationsPage({ initialConversationId }: ConversationsPageProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(initialConversationId || null);
@@ -39,6 +57,9 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
 
   const [activeConv, setActiveConv] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [customerOrders, setCustomerOrders] = useState<Order[]>([]);
   const [withinWindow, setWithinWindow] = useState(true);
@@ -58,12 +79,24 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
   const [sendingTest, setSendingTest] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const selectedIdRef = useRef<string | null>(selectedId);
+  const filterRef = useRef(filter);
+  const searchRef = useRef(search);
+  const detailSeqRef = useRef(0);
+  const skipNextAutoScrollRef = useRef(false);
 
-  async function loadList(preserveSelection = true) {
+  selectedIdRef.current = selectedId;
+  filterRef.current = filter;
+  searchRef.current = search;
+
+  const loadList = useCallback(async (preserveSelection = true) => {
     try {
-      const res = await api.listConversations({ filter, search: search.trim() || undefined });
+      const res = await api.listConversations({
+        filter: filterRef.current,
+        search: searchRef.current.trim() || undefined,
+      });
       setConversations(res.conversations);
-      if (!preserveSelection && res.conversations.length > 0 && !selectedId) {
+      if (!preserveSelection && res.conversations.length > 0 && !selectedIdRef.current) {
         setSelectedId(res.conversations[0]._id);
       }
     } catch (err) {
@@ -71,28 +104,62 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
     } finally {
       setLoadingList(false);
     }
-  }
+  }, []);
 
-  async function loadDetail(id: string) {
-    setLoadingDetail(true);
-    setError(null);
+  const loadDetail = useCallback(async (id: string, silent = false) => {
+    const seq = ++detailSeqRef.current;
+    if (!silent) {
+      setLoadingDetail(true);
+      setError(null);
+    }
     try {
-      const res = await api.getConversationDetail(id);
+      const res = await api.getConversationDetail(id, { limit: 100 });
+      if (seq !== detailSeqRef.current || selectedIdRef.current !== id) return;
       setActiveConv(res.conversation);
       setMessages(res.messages);
+      setHasMoreMessages(res.hasMore);
+      setNextCursor(res.nextCursor);
       setCustomer(res.customer);
       setCustomerOrders(res.customerOrders);
       setWithinWindow(res.withinMessagingWindow);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load conversation.');
+      if (!silent && seq === detailSeqRef.current) {
+        setError(err instanceof Error ? err.message : 'Failed to load conversation.');
+      }
     } finally {
-      setLoadingDetail(false);
+      if (!silent && seq === detailSeqRef.current) {
+        setLoadingDetail(false);
+      }
+    }
+  }, []);
+
+  async function handleLoadOlder() {
+    if (!selectedId || !nextCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const res = await api.getConversationDetail(selectedId, { limit: 50, before: nextCursor });
+      if (selectedIdRef.current !== selectedId) return;
+      skipNextAutoScrollRef.current = true;
+      setMessages((prev) => {
+        const existingIds = new Set(prev.map((m) => m.message_id || m._id));
+        const older = res.messages.filter((m) => !existingIds.has(m.message_id || m._id));
+        return [...older, ...prev];
+      });
+      setHasMoreMessages(res.hasMore);
+      setNextCursor(res.nextCursor);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load earlier messages.');
+    } finally {
+      setLoadingOlder(false);
     }
   }
 
   useEffect(() => {
-    void loadList(false);
-  }, [filter]);
+    const timer = setTimeout(() => {
+      void loadList(false);
+    }, search ? 200 : 0);
+    return () => clearTimeout(timer);
+  }, [filter, search, loadList]);
 
   useEffect(() => {
     if (initialConversationId) {
@@ -106,33 +173,110 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
     } else {
       setActiveConv(null);
       setMessages([]);
+      setHasMoreMessages(false);
+      setNextCursor(null);
       setCustomer(null);
       setCustomerOrders([]);
     }
-  }, [selectedId]);
+  }, [selectedId, loadDetail]);
 
   useEffect(() => {
+    if (skipNextAutoScrollRef.current) {
+      skipNextAutoScrollRef.current = false;
+      return;
+    }
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      void loadList(true);
-      if (selectedId) {
-        void api
-          .getConversationDetail(selectedId)
-          .then((res) => {
-            setActiveConv(res.conversation);
-            setMessages(res.messages);
-            setCustomer(res.customer);
-            setCustomerOrders(res.customerOrders);
-            setWithinWindow(res.withinMessagingWindow);
-          })
-          .catch(() => undefined);
+    const unsubscribe = subscribeRealtimeEvents({
+      onMessageCreated: ({ conversationId, message, conversation }) => {
+        if (conversation) {
+          const matchesFilter =
+            filterRef.current === 'all' ||
+            (filterRef.current === 'ai_active' && conversation.aiEnabled && !conversation.humanTakeover) ||
+            (filterRef.current === 'human_takeover' && conversation.humanTakeover);
+          const q = searchRef.current.trim().toLowerCase();
+          const matchesSearch =
+            !q ||
+            conversation.customerName.toLowerCase().includes(q) ||
+            conversation.messengerId.toLowerCase().includes(q) ||
+            conversation.lastMessageText.toLowerCase().includes(q);
+
+          if (matchesFilter && matchesSearch) {
+            setConversations((prev) => upsertSortedConversation(prev, conversation));
+          } else {
+            setConversations((prev) => prev.filter((c) => c._id !== conversation._id));
+          }
+        } else {
+          void loadList(true);
+        }
+
+        if (selectedIdRef.current === conversationId) {
+          setMessages((prev) => mergeMessageUnique(prev, message));
+          if (conversation) {
+            setActiveConv(conversation);
+            setWithinWindow(true);
+          }
+        }
+      },
+      onConversationUpdated: ({ conversation }) => {
+        const matchesFilter =
+          filterRef.current === 'all' ||
+          (filterRef.current === 'ai_active' && conversation.aiEnabled && !conversation.humanTakeover) ||
+          (filterRef.current === 'human_takeover' && conversation.humanTakeover);
+
+        if (matchesFilter) {
+          setConversations((prev) => upsertSortedConversation(prev, conversation));
+        } else {
+          setConversations((prev) => prev.filter((c) => c._id !== conversation._id));
+        }
+
+        if (selectedIdRef.current === conversation._id) {
+          setActiveConv(conversation);
+        }
+      },
+      onOrderCreated: ({ order }) => {
+        if (selectedIdRef.current === order.conversationId) {
+          setCustomerOrders((prev) => {
+            if (prev.some((o) => o._id === order._id)) return prev;
+            return [order, ...prev];
+          });
+        }
+      },
+      onReconnect: () => {
+        void loadList(true);
+        if (selectedIdRef.current) {
+          void loadDetail(selectedIdRef.current, true);
+        }
+      },
+    });
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadList(true);
+        if (selectedIdRef.current) {
+          void loadDetail(selectedIdRef.current, true);
+        }
       }
-    }, 6000);
-    return () => clearInterval(timer);
-  }, [selectedId, filter, search]);
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    const fallbackPoll = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadList(true);
+        if (selectedIdRef.current) {
+          void loadDetail(selectedIdRef.current, true);
+        }
+      }
+    }, 15000);
+
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', handleVisibility);
+      clearInterval(fallbackPoll);
+    };
+  }, [loadList, loadDetail]);
 
   async function handleToggleAI(enableAI: boolean) {
     if (!activeConv) return;
@@ -161,11 +305,9 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
     setError(null);
     try {
       const res = await api.sendAdminMessage(activeConv._id, replyText.trim());
-      setMessages((prev) => [...prev, res.message]);
+      setMessages((prev) => mergeMessageUnique(prev, res.message));
       setActiveConv(res.conversation);
-      setConversations((prev) =>
-        prev.map((c) => (c._id === res.conversation._id ? res.conversation : c)),
-      );
+      setConversations((prev) => upsertSortedConversation(prev, res.conversation));
       setReplyText('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send reply.');
@@ -469,6 +611,18 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
 
               {/* Messages */}
               <div className="flex-1 overflow-y-auto p-5 space-y-4 bg-slate-50/50 subtle-scroll">
+                {hasMoreMessages && (
+                  <div className="flex justify-center">
+                    <button
+                      type="button"
+                      disabled={loadingOlder}
+                      onClick={() => void handleLoadOlder()}
+                      className="px-3 py-1 text-xs font-medium text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 rounded-md cursor-pointer disabled:opacity-50"
+                    >
+                      {loadingOlder ? 'Loading...' : 'Load earlier messages'}
+                    </button>
+                  </div>
+                )}
                 {loadingDetail && messages.length === 0 ? (
                   <div className="space-y-3">
                     <div className="h-12 w-2/3 bg-slate-100 rounded-xl animate-pulse" />
@@ -478,23 +632,27 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
                   <p className="text-xs text-slate-500 text-center py-8">No messages in this thread.</p>
                 ) : (
                   messages.map((msg) => {
-                    const isCustomer = msg.sender === 'customer';
+                    const senderType = msg.sender_type ?? msg.sender;
+                    const msgText = msg.message_text ?? msg.text;
+                    const msgTime = msg.timestamp ?? msg.createdAt;
+                    const msgDelivery = msg.delivery_status ?? msg.deliveryStatus;
+                    const isCustomer = senderType === 'customer';
                     return (
                       <div
-                        key={msg._id}
+                        key={msg.message_id || msg._id}
                         className={`flex flex-col ${isCustomer ? 'items-start' : 'items-end'}`}
                       >
                         <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px] text-slate-500">
                           <span className="font-medium">
                             {isCustomer
                               ? activeConv.customerName
-                              : msg.sender === 'ai'
+                              : senderType === 'ai'
                                 ? 'AI Sales Agent'
                                 : 'Admin'}
                           </span>
                           <span aria-hidden="true">·</span>
-                          <span className="font-mono tabular-nums">{formatShortTime(msg.createdAt)}</span>
-                          {msg.deliveryStatus === 'failed' && (
+                          <span className="font-mono tabular-nums">{formatShortTime(msgTime)}</span>
+                          {msgDelivery === 'failed' && (
                             <>
                               <span aria-hidden="true">·</span>
                               <span className="text-red-600">Delivery failed</span>
@@ -505,12 +663,12 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
                           className={`max-w-[76%] px-4 py-2.5 text-[13.5px] whitespace-pre-wrap leading-relaxed ${
                             isCustomer
                               ? 'bg-white border border-slate-200/90 text-slate-900 rounded-2xl rounded-tl-sm shadow-[0_1px_2px_rgba(15,23,42,0.03)]'
-                              : msg.sender === 'ai'
+                              : senderType === 'ai'
                                 ? 'bg-blue-600 text-white rounded-2xl rounded-tr-sm shadow-[0_1px_2px_rgba(37,99,235,0.2)]'
                                 : 'bg-slate-900 text-white rounded-2xl rounded-tr-sm'
                           }`}
                         >
-                          {msg.text}
+                          {msgText}
                         </div>
                       </div>
                     );

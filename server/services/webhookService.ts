@@ -4,6 +4,7 @@ import type { OrderDoc, WebhookEventDoc } from '../types.ts';
 import { runAISalesAgent } from './aiOrchestrationService.ts';
 import {
   addMessage,
+  findMessageByExternalId,
   isWithinMessagingWindow,
   upsertConversation,
 } from './conversationService.ts';
@@ -34,6 +35,21 @@ interface MetaWebhookPayload {
     time?: number;
     messaging?: MetaMessagingEvent[];
   }>;
+}
+
+const customerTurnLocks = new Map<string, Promise<unknown>>();
+
+async function withCustomerLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = customerTurnLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  customerTurnLocks.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (customerTurnLocks.get(key) === next) {
+      customerTurnLocks.delete(key);
+    }
+  }
 }
 
 export function verifyMetaSignature(rawBody: Buffer, signatureHeader: string | undefined): boolean {
@@ -79,7 +95,10 @@ export async function enqueueMetaWebhookPayload(payload: MetaWebhookPayload): Pr
       const text = ev.message?.text?.trim() || ev.postback?.title?.trim() || ev.postback?.payload?.trim();
       if (!senderId || !text) continue;
 
-      const messageId = ev.message?.mid || ev.postback?.mid;
+      // Ignore events where sender IS the page itself (echo fallback)
+      if (recipientId && senderId === recipientId) continue;
+
+      const messageId = ev.message?.mid?.trim() || ev.postback?.mid?.trim() || undefined;
       const timestamp = Number(ev.timestamp || entry.time || Date.now());
       const eventId =
         messageId ||
@@ -128,9 +147,11 @@ export async function enqueueMetaWebhookPayload(payload: MetaWebhookPayload): Pr
 
 export async function processCustomerTurn(params: {
   senderId: string;
+  pageId?: string;
   senderName?: string;
   text: string;
   externalMessageId?: string;
+  eventTimestamp?: number;
   sendToMessenger: boolean;
   source: 'messenger_ai' | 'test_simulator';
 }): Promise<{
@@ -142,128 +163,171 @@ export async function processCustomerTurn(params: {
   createdOrder?: OrderDoc;
   fallbackUsed?: boolean;
 }> {
-  const profile = params.sendToMessenger
-    ? await fetchMessengerUserProfile(params.senderId)
-    : {};
+  return withCustomerLock(params.senderId, async () => {
+    const settings = await getSettings();
+    const resolvedPageId =
+      params.pageId?.trim() ||
+      settings.facebookPageId?.trim() ||
+      (params.senderId.startsWith('sim_') ? 'simulator' : undefined);
 
-  const customer = await upsertCustomerByMessengerId({
-    messengerId: params.senderId,
-    name: params.senderName || profile.name,
-    profilePic: profile.profilePic,
-  });
+    const profile = params.sendToMessenger
+      ? await fetchMessengerUserProfile(params.senderId)
+      : {};
 
-  const conversation = await upsertConversation({
-    customerId: customer._id,
-    messengerId: customer.messengerId,
-    customerName: customer.name,
-  });
-
-  // Store incoming customer message (deduplicated by externalMessageId if present)
-  await addMessage({
-    conversationId: conversation._id,
-    customerId: customer._id,
-    messengerId: customer.messengerId,
-    sender: 'customer',
-    text: params.text,
-    externalMessageId: params.externalMessageId,
-    deliveryStatus: 'received',
-  });
-
-  const settings = await getSettings();
-  if (!settings.aiGlobalEnabled || !conversation.aiEnabled || conversation.humanTakeover) {
-    return {
-      conversationId: conversation._id,
-      customerId: customer._id,
-      aiReplied: false,
-    };
-  }
-
-  // Re-check 24-hour messaging window before sending outbound automated reply
-  if (params.sendToMessenger && !isWithinMessagingWindow(new Date())) {
-    return {
-      conversationId: conversation._id,
-      customerId: customer._id,
-      aiReplied: false,
-    };
-  }
-
-  let replyText: string;
-  let action = 'none';
-  let language = 'english';
-  let recommendedProductIds: string[] = [];
-  let createdOrder: OrderDoc | undefined;
-  let handoverTriggered = false;
-  let fallbackUsed = false;
-
-  try {
-    const aiResult = await runAISalesAgent({
-      conversationId: conversation._id,
-      customerId: customer._id,
-      latestCustomerMessage: params.text,
-      source: params.source,
+    const customer = await upsertCustomerByMessengerId({
+      messengerId: params.senderId,
+      pageId: resolvedPageId,
+      name: params.senderName || profile.name,
+      profilePic: profile.profilePic,
     });
-    replyText = aiResult.replyText;
-    action = aiResult.action;
-    language = aiResult.detectedLanguage;
-    recommendedProductIds = aiResult.recommendedProductIds;
-    createdOrder = aiResult.createdOrder;
-    handoverTriggered = aiResult.handoverTriggered;
-  } catch (err) {
-    console.error('[ai] AI orchestration error, using safe fallback:', err);
-    fallbackUsed = true;
-    replyText =
-      settings.aiLanguageMode === 'bangla'
-        ? 'মেসেজ করার জন্য ধন্যবাদ! আমাদের টিম শীঘ্রই আপনাকে রিপ্লাই দিবে।'
-        : 'Thank you for messaging us! Our team has received your message and will get back to you shortly.';
-  }
 
-  let deliveryStatus: 'sent' | 'failed' | 'simulated' = params.sendToMessenger ? 'sent' : 'simulated';
-  let deliveryError: string | undefined;
-  let outboundMessageId: string | undefined;
+    const conversation = await upsertConversation({
+      customerId: customer._id,
+      messengerId: customer.messengerId,
+      pageId: resolvedPageId,
+      customerName: customer.name,
+    });
 
-  if (params.sendToMessenger) {
-    try {
-      const sendRes = await sendMessengerText({
-        recipientId: customer.messengerId,
-        text: replyText,
-      });
-      if (sendRes.skipped) {
-        deliveryStatus = 'failed';
-        deliveryError = sendRes.reason;
-      } else {
-        outboundMessageId = sendRes.messageId;
+    const msgSource = params.source === 'messenger_ai' ? 'messenger' : 'dashboard';
+    const cleanExtId = params.externalMessageId?.trim() || undefined;
+
+    // If this webhook message was already saved & replied to on an earlier attempt, avoid double-replying
+    if (cleanExtId) {
+      const existingCustomerMsg = await findMessageByExternalId(cleanExtId);
+      if (existingCustomerMsg) {
+        const { messages } = getCollections();
+        const laterReplies = await messages.find(
+          {
+            conversationId: existingCustomerMsg.conversationId,
+            sender: 'ai',
+            createdAt: { $gte: existingCustomerMsg.createdAt },
+          },
+          { limit: 1 },
+        );
+        if (laterReplies.length > 0) {
+          return {
+            conversationId: existingCustomerMsg.conversationId,
+            customerId: existingCustomerMsg.customerId,
+            aiReplied: false,
+          };
+        }
       }
-    } catch (sendErr) {
-      deliveryStatus = 'failed';
-      deliveryError = sendErr instanceof Error ? sendErr.message : 'Messenger send failed';
     }
-  }
 
-  await addMessage({
-    conversationId: conversation._id,
-    customerId: customer._id,
-    messengerId: customer.messengerId,
-    sender: 'ai',
-    text: replyText,
-    externalMessageId: outboundMessageId,
-    deliveryStatus,
-    deliveryError,
-    aiMetadata: {
-      action,
-      language,
-      recommendedProductIds,
-    },
+    const incomingTime =
+      params.eventTimestamp && params.eventTimestamp > 1_000_000_000_000
+        ? new Date(params.eventTimestamp)
+        : new Date();
+
+    // Store incoming customer message (deduplicated by externalMessageId if present)
+    await addMessage({
+      conversationId: conversation._id,
+      customerId: customer._id,
+      messengerId: customer.messengerId,
+      sender: 'customer',
+      text: params.text,
+      externalMessageId: cleanExtId,
+      deliveryStatus: 'received',
+      source: msgSource,
+      timestamp: incomingTime,
+    });
+
+    if (!settings.aiGlobalEnabled || !conversation.aiEnabled || conversation.humanTakeover) {
+      return {
+        conversationId: conversation._id,
+        customerId: customer._id,
+        aiReplied: false,
+      };
+    }
+
+    // Re-check 24-hour messaging window before sending outbound automated reply
+    if (params.sendToMessenger && !isWithinMessagingWindow(new Date())) {
+      return {
+        conversationId: conversation._id,
+        customerId: customer._id,
+        aiReplied: false,
+      };
+    }
+
+    let replyText: string;
+    let action = 'none';
+    let language = 'english';
+    let recommendedProductIds: string[] = [];
+    let createdOrder: OrderDoc | undefined;
+    let handoverTriggered = false;
+    let fallbackUsed = false;
+
+    try {
+      const aiResult = await runAISalesAgent({
+        conversationId: conversation._id,
+        customerId: customer._id,
+        latestCustomerMessage: params.text,
+        source: params.source,
+      });
+      replyText = aiResult.replyText;
+      action = aiResult.action;
+      language = aiResult.detectedLanguage;
+      recommendedProductIds = aiResult.recommendedProductIds;
+      createdOrder = aiResult.createdOrder;
+      handoverTriggered = aiResult.handoverTriggered;
+    } catch (err) {
+      console.error('[ai] AI orchestration error, using safe fallback:', err);
+      fallbackUsed = true;
+      replyText =
+        settings.aiLanguageMode === 'bangla'
+          ? 'মেসেজ করার জন্য ধন্যবাদ! আমাদের টিম শীঘ্রই আপনাকে রিপ্লাই দিবে।'
+          : 'Thank you for messaging us! Our team has received your message and will get back to you shortly.';
+    }
+
+    let deliveryStatus: 'sent' | 'failed' | 'simulated' = params.sendToMessenger ? 'sent' : 'simulated';
+    let deliveryError: string | undefined;
+    let outboundMessageId: string | undefined;
+
+    if (params.sendToMessenger) {
+      try {
+        const sendRes = await sendMessengerText({
+          recipientId: customer.messengerId,
+          text: replyText,
+        });
+        if (sendRes.skipped) {
+          deliveryStatus = 'failed';
+          deliveryError = sendRes.reason;
+        } else {
+          outboundMessageId = sendRes.messageId;
+        }
+      } catch (sendErr) {
+        deliveryStatus = 'failed';
+        deliveryError = sendErr instanceof Error ? sendErr.message : 'Messenger send failed';
+      }
+    }
+
+    await addMessage({
+      conversationId: conversation._id,
+      customerId: customer._id,
+      messengerId: customer.messengerId,
+      sender: 'ai',
+      text: replyText,
+      externalMessageId: outboundMessageId,
+      deliveryStatus,
+      deliveryError,
+      source: msgSource,
+      aiMetadata: {
+        action,
+        language,
+        recommendedProductIds,
+      },
+    });
+
+    return {
+      conversationId: conversation._id,
+      customerId: customer._id,
+      aiReplied: true,
+      replyText,
+      handoverTriggered,
+      createdOrder,
+      fallbackUsed,
+    };
   });
-
-  return {
-    conversationId: conversation._id,
-    customerId: customer._id,
-    aiReplied: true,
-    replyText,
-    handoverTriggered,
-    createdOrder,
-    fallbackUsed,
-  };
 }
 
 let workerRunning = false;
@@ -283,8 +347,10 @@ async function processSingleJob(job: WebhookEventDoc): Promise<void> {
 
     await processCustomerTurn({
       senderId: job.senderId,
+      pageId: job.recipientId || undefined,
       text: job.messageText,
-      externalMessageId: job.messageId,
+      externalMessageId: job.messageId || job.eventId,
+      eventTimestamp: job.timestamp,
       sendToMessenger: true,
       source: 'messenger_ai',
     });
@@ -298,6 +364,8 @@ async function processSingleJob(job: WebhookEventDoc): Promise<void> {
     const nextAttempt = job.attempts + 1;
     const isTerminal = nextAttempt >= job.maxAttempts;
     const backoffMs = Math.min(60000, 2000 * Math.pow(2, nextAttempt));
+
+    console.error(`[queue] Job ${job._id} failed (attempt ${nextAttempt}):`, errorMsg);
 
     await webhook_events.updateOne(
       { _id: job._id },
@@ -321,9 +389,17 @@ export async function drainWebhookQueue(): Promise<void> {
   try {
     const { webhook_events } = getCollections();
     const now = new Date();
+
+    // Recover any stale processing jobs stuck > 2 minutes (e.g. after server restart)
+    const staleCutoff = new Date(Date.now() - 2 * 60 * 1000);
+    await webhook_events.updateMany(
+      { status: 'processing', updatedAt: { $lt: staleCutoff } },
+      { $set: { status: 'pending', nextRetryAt: now, updatedAt: now } },
+    );
+
     const dueJobs = await webhook_events.find(
       { status: 'pending', nextRetryAt: { $lte: now } },
-      { sort: { createdAt: 1 }, limit: 10 },
+      { sort: { createdAt: 1 }, limit: 15 },
     );
 
     for (const job of dueJobs) {
@@ -345,9 +421,11 @@ export async function drainWebhookQueue(): Promise<void> {
 
 export function startWebhookWorker(): void {
   if (workerTimer) return;
+  void drainWebhookQueue();
   workerTimer = setInterval(() => {
     void drainWebhookQueue();
   }, 3000);
+  workerTimer.unref?.();
 }
 
 export function stopWebhookWorker(): void {

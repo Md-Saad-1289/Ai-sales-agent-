@@ -3,22 +3,28 @@ import type { BuyingIntent, CustomerDoc, OrderDoc } from '../types.ts';
 
 export async function upsertCustomerByMessengerId(params: {
   messengerId: string;
+  pageId?: string;
   name?: string;
   profilePic?: string;
 }): Promise<CustomerDoc> {
   const { customers } = getCollections();
-  const existing = await customers.findOne({ messengerId: params.messengerId });
-  const now = new Date();
+  const cleanName = params.name?.trim();
+  const cleanPageId = params.pageId?.trim() || undefined;
 
-  if (existing) {
-    const updates: Record<string, unknown> = { updatedAt: now };
-    if (params.name && existing.name.startsWith('Customer ')) {
-      updates.name = params.name;
+  async function syncExisting(existing: CustomerDoc): Promise<CustomerDoc> {
+    const now = new Date();
+    const updates: Record<string, unknown> = {};
+    if (cleanName && existing.name.startsWith('Customer ')) {
+      updates.name = cleanName;
     }
     if (params.profilePic && !existing.profilePic) {
       updates.profilePic = params.profilePic;
     }
-    if (Object.keys(updates).length > 1) {
+    if (cleanPageId && !existing.pageId) {
+      updates.pageId = cleanPageId;
+    }
+    if (Object.keys(updates).length > 0) {
+      updates.updatedAt = now;
       const updated = await customers.findOneAndUpdate(
         { _id: existing._id },
         { $set: updates },
@@ -29,15 +35,31 @@ export async function upsertCustomerByMessengerId(params: {
     return existing;
   }
 
-  return customers.insertOne({
-    messengerId: params.messengerId,
-    name: params.name || `Customer ${params.messengerId.slice(-6)}`,
-    profilePic: params.profilePic,
-    preferences: [],
-    buyingIntent: 'unknown',
-    createdAt: now,
-    updatedAt: now,
-  });
+  const existing = await customers.findOne({ messengerId: params.messengerId });
+  if (existing) {
+    return syncExisting(existing);
+  }
+
+  const now = new Date();
+  try {
+    return await customers.insertOne({
+      messengerId: params.messengerId,
+      pageId: cleanPageId,
+      name: cleanName || `Customer ${params.messengerId.slice(-6)}`,
+      profilePic: params.profilePic,
+      preferences: [],
+      buyingIntent: 'unknown',
+      createdAt: now,
+      updatedAt: now,
+    });
+  } catch (err) {
+    const code = (err as { code?: number }).code;
+    if (code === 11000) {
+      const raced = await customers.findOne({ messengerId: params.messengerId });
+      if (raced) return syncExisting(raced);
+    }
+    throw err;
+  }
 }
 
 export async function updateCustomerInsights(

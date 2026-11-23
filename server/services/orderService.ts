@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getCollections } from '../db/mongo.ts';
 import type { OrderDoc, OrderStatus } from '../types.ts';
 import { decrementStock, getProductById, restoreStock } from './productService.ts';
+import { emitRealtimeEvent } from './realtimeService.ts';
 import { getSettings } from './settingsService.ts';
 
 export const orderStatusSchema = z.enum([
@@ -113,6 +114,7 @@ export async function createValidatedOrder(
       updatedAt: now,
     });
 
+    emitRealtimeEvent('order:created', { order });
     return { order, deduplicated: false };
   } catch (err) {
     // Restore reserved stock on insert failure unless duplicate key returned the existing order
@@ -166,6 +168,10 @@ export async function updateOrderStatus(id: string, nextStatus: OrderStatus): Pr
     for (const item of current.items) {
       await restoreStock(item.productId, item.quantity);
     }
+  }
+
+  if (updated) {
+    emitRealtimeEvent('order:updated', { order: updated });
   }
 
   return updated;

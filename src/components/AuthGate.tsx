@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { Eye, EyeOff, MessageSquare } from 'lucide-react';
-import { api, setAuthToken } from '../lib/api';
+import { api } from '../lib/api';
 import type { AdminUser, AuthBootstrapStatus } from '../types';
 
 interface AuthGateProps {
@@ -26,7 +26,6 @@ export function AuthGate({ status, onAuthenticated }: AuthGateProps) {
       const res = isSetup
         ? await api.claimAdmin({ email: email.trim(), name: name.trim(), password })
         : await api.login({ email: email.trim() || undefined, password });
-      setAuthToken(res.token);
       onAuthenticated(res.admin);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');

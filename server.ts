@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import express, { type Request } from 'express';
 import { closeDatabase, initDatabase } from './server/db/mongo.ts';
 import { createApiRouter, type RawBodyRequest } from './server/routes/api.ts';
+import { ensureAuthSecret } from './server/services/authService.ts';
+import { stopRealtimeHeartbeat } from './server/services/realtimeService.ts';
 import { getSettings } from './server/services/settingsService.ts';
 import { startWebhookWorker, stopWebhookWorker } from './server/services/webhookService.ts';
 
@@ -14,6 +16,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 async function bootstrap() {
   await initDatabase();
+  await ensureAuthSecret();
   await getSettings();
 
   const app = express();
@@ -59,6 +62,7 @@ async function bootstrap() {
 
   const shutdown = async () => {
     stopWebhookWorker();
+    stopRealtimeHeartbeat();
     server.close();
     await closeDatabase();
     process.exit(0);

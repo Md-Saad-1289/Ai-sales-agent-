@@ -127,7 +127,7 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
         setError(err instanceof Error ? err.message : 'Failed to load conversation.');
       }
     } finally {
-      if (!silent && seq === detailSeqRef.current) {
+      if (!silent) {
         setLoadingDetail(false);
       }
     }
@@ -199,9 +199,9 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
           const q = searchRef.current.trim().toLowerCase();
           const matchesSearch =
             !q ||
-            conversation.customerName.toLowerCase().includes(q) ||
-            conversation.messengerId.toLowerCase().includes(q) ||
-            conversation.lastMessageText.toLowerCase().includes(q);
+            (conversation.customerName || '').toLowerCase().includes(q) ||
+            (conversation.messengerId || '').toLowerCase().includes(q) ||
+            (conversation.lastMessageText || '').toLowerCase().includes(q);
 
           if (matchesFilter && matchesSearch) {
             setConversations((prev) => upsertSortedConversation(prev, conversation));
@@ -343,9 +343,9 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
     if (!search.trim()) return true;
     const q = search.trim().toLowerCase();
     return (
-      c.customerName.toLowerCase().includes(q) ||
-      c.messengerId.toLowerCase().includes(q) ||
-      c.lastMessageText.toLowerCase().includes(q)
+      (c.customerName || '').toLowerCase().includes(q) ||
+      (c.messengerId || '').toLowerCase().includes(q) ||
+      (c.lastMessageText || '').toLowerCase().includes(q)
     );
   });
 

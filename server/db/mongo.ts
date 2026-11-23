@@ -403,7 +403,7 @@ class MongoCollectionWrapper<T extends { _id: string }> implements CollectionAda
   ): Promise<T | null> {
     const doc = await this.col.findOneAndUpdate(filter, sanitizeUpdate(update), {
       returnDocument: options.returnDocument ?? 'after',
-      upsert: options.upsert,
+      upsert: Boolean(options.upsert),
     });
     return (doc as unknown as T) ?? null;
   }
@@ -488,6 +488,41 @@ async function migrateMessagesIndexesAndNulls(database: Db): Promise<void> {
 
 async function deduplicateConversationsAndCustomers(cols: DatabaseCollections): Promise<void> {
   try {
+    const allCustomers = await cols.customers.find({}, { sort: { updatedAt: -1 } });
+    const customersByMessenger = new Map<string, CustomerDoc[]>();
+    for (const cust of allCustomers) {
+      const list = customersByMessenger.get(cust.messengerId) ?? [];
+      list.push(cust);
+      customersByMessenger.set(cust.messengerId, list);
+    }
+
+    for (const [messengerId, custList] of customersByMessenger.entries()) {
+      if (custList.length <= 1) continue;
+      const rankedCusts = [...custList].sort((a, b) => {
+        const aScore = (a.phone ? 2 : 0) + (a.name && !a.name.startsWith('Customer ') ? 1 : 0);
+        const bScore = (b.phone ? 2 : 0) + (b.name && !b.name.startsWith('Customer ') ? 1 : 0);
+        if (aScore !== bScore) return bScore - aScore;
+        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      });
+      const primaryCust = rankedCusts[0];
+      for (const secondaryCust of rankedCusts.slice(1)) {
+        await cols.conversations.updateMany(
+          { customerId: secondaryCust._id },
+          { $set: { customerId: primaryCust._id, updatedAt: new Date() } },
+        );
+        await cols.messages.updateMany(
+          { customerId: secondaryCust._id },
+          { $set: { customerId: primaryCust._id, customer_id: primaryCust._id } },
+        );
+        await cols.orders.updateMany(
+          { customerId: secondaryCust._id },
+          { $set: { customerId: primaryCust._id } },
+        );
+        await cols.customers.deleteOne({ _id: secondaryCust._id });
+      }
+      console.log(`[db] Deduplicated ${custList.length - 1} duplicate customer(s) for PSID ${messengerId}`);
+    }
+
     const allConvs = await cols.conversations.find({}, { sort: { lastMessageAt: -1 } });
     const byMessenger = new Map<string, ConversationDoc[]>();
     for (const conv of allConvs) {
@@ -501,8 +536,8 @@ async function deduplicateConversationsAndCustomers(cols: DatabaseCollections): 
 
       // Prefer conversation that has messages / non-empty lastMessageText, then most recent
       const ranked = [...list].sort((a, b) => {
-        const aHasMsg = a.lastMessageText.trim().length > 0 ? 1 : 0;
-        const bHasMsg = b.lastMessageText.trim().length > 0 ? 1 : 0;
+        const aHasMsg = (a.lastMessageText || '').trim().length > 0 ? 1 : 0;
+        const bHasMsg = (b.lastMessageText || '').trim().length > 0 ? 1 : 0;
         if (aHasMsg !== bHasMsg) return bHasMsg - aHasMsg;
         return new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime();
       });

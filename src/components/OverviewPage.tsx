@@ -64,9 +64,17 @@ export function OverviewPage({ onNavigate }: OverviewPageProps) {
       }
     };
     document.addEventListener('visibilitychange', handleVisibility);
+
+    const fallbackPoll = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadOverview(true);
+      }
+    }, 15000);
+
     return () => {
       unsubscribe();
       document.removeEventListener('visibilitychange', handleVisibility);
+      clearInterval(fallbackPoll);
     };
   }, [loadOverview]);
 

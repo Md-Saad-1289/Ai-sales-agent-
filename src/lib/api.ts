@@ -5,6 +5,7 @@ import type {
   Conversation,
   Customer,
   EnvironmentStatus,
+  GeminiApiKeySummary,
   KnowledgeCategory,
   KnowledgeEntry,
   KnowledgeProposal,
@@ -353,13 +354,73 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
   getSettings: () =>
-    request<{ settings: Settings; environment: EnvironmentStatus }>('/api/settings'),
+    request<{
+      settings: Settings;
+      environment: EnvironmentStatus;
+      geminiKeys?: {
+        keys: GeminiApiKeySummary[];
+        activeKeyId: string | null;
+        envKeyPresent: boolean;
+      };
+    }>('/api/settings'),
   updateSettings: (
     body: Omit<Settings, '_id' | 'updatedAt'>,
   ) =>
     request<{ settings: Settings; environment: EnvironmentStatus }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify(body),
+    }),
+  listGeminiKeys: () =>
+    request<{
+      keys: GeminiApiKeySummary[];
+      activeKeyId: string | null;
+      envKeyPresent: boolean;
+      environment: EnvironmentStatus;
+    }>('/api/settings/gemini-keys'),
+  addGeminiKey: (body: { apiKey: string; label?: string; makePrimary?: boolean }) =>
+    request<{
+      key: GeminiApiKeySummary;
+      keys: GeminiApiKeySummary[];
+      activeKeyId: string | null;
+      envKeyPresent: boolean;
+      environment: EnvironmentStatus;
+    }>('/api/settings/gemini-keys', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateGeminiKey: (
+    id: string,
+    body: { label?: string; isActive?: boolean; makePrimary?: boolean; resetStatus?: boolean },
+  ) =>
+    request<{
+      keys: GeminiApiKeySummary[];
+      activeKeyId: string | null;
+      envKeyPresent: boolean;
+      environment: EnvironmentStatus;
+    }>(`/api/settings/gemini-keys/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  testGeminiKey: (id: string) =>
+    request<{
+      ok: boolean;
+      status: GeminiApiKeySummary['status'];
+      message: string;
+      keys: GeminiApiKeySummary[];
+      activeKeyId: string | null;
+      envKeyPresent: boolean;
+      environment: EnvironmentStatus;
+    }>(`/api/settings/gemini-keys/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+    }),
+  deleteGeminiKey: (id: string) =>
+    request<{
+      keys: GeminiApiKeySummary[];
+      activeKeyId: string | null;
+      envKeyPresent: boolean;
+      environment: EnvironmentStatus;
+    }>(`/api/settings/gemini-keys/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
     }),
   verifyFacebookConnection: () =>
     request<{ connected: boolean; pageId?: string; pageName?: string; error?: string }>(

@@ -140,10 +140,27 @@ export interface Settings {
   updatedAt: string;
 }
 
+export interface GeminiApiKeySummary {
+  id: string;
+  label: string;
+  maskedKey: string;
+  source: 'settings' | 'env';
+  isActive: boolean;
+  isCurrent: boolean;
+  status: 'active' | 'rate_limited' | 'invalid' | 'disabled';
+  cooldownUntil?: string;
+  lastError?: string;
+  lastUsedAt?: string;
+  requestCount: number;
+  createdAt: string;
+}
+
 export interface EnvironmentStatus {
   databaseMode: 'mongodb' | 'memory';
   databaseError: string | null;
   geminiConfigured: boolean;
+  geminiKeysCount?: number;
+  activeGeminiKeysCount?: number;
   metaPageTokenConfigured: boolean;
   metaAppSecretConfigured: boolean;
   metaVerifyTokenConfigured: boolean;

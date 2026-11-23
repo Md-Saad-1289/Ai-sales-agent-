@@ -127,6 +127,23 @@ export interface OrderDoc {
   updatedAt: Date;
 }
 
+export type GeminiKeyStatus = 'active' | 'rate_limited' | 'invalid' | 'disabled';
+
+export interface StoredGeminiApiKey {
+  id: string;
+  label: string;
+  maskedKey: string;
+  encryptedKey: string;
+  keyHash: string;
+  isActive: boolean;
+  status: GeminiKeyStatus;
+  cooldownUntil?: Date;
+  lastError?: string;
+  lastUsedAt?: Date;
+  requestCount: number;
+  createdAt: Date;
+}
+
 export interface SettingsDoc {
   _id: string;
   key: 'primary';
@@ -144,6 +161,8 @@ export interface SettingsDoc {
   humanHandoverRules: string;
   facebookPageId: string;
   facebookPageName: string;
+  geminiApiKeys?: StoredGeminiApiKey[];
+  activeGeminiKeyId?: string;
   updatedAt: Date;
 }
 

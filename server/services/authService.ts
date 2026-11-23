@@ -62,6 +62,10 @@ function getSigningSecretSync(): string {
   return cachedSigningSecret;
 }
 
+export function getServerEncryptionSecret(): string {
+  return getSigningSecretSync();
+}
+
 export interface AuthTokenPayload {
   sub: string;
   email: string;

@@ -1,30 +1,11 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { z } from 'zod';
 import type { BuyingIntent, DraftOrderState, OrderDoc, ProductDoc } from '../types.ts';
 import { buildConversationContext, sanitizeUntrustedText } from './contextService.ts';
 import { setConversationAIState, updateConversationDraftOrder } from './conversationService.ts';
 import { updateCustomerInsights } from './customerService.ts';
+import { executeWithGemini, GEMINI_MODEL } from './geminiClient.ts';
 import { computeDraftSummaryHash, createValidatedOrder } from './orderService.ts';
-
-let geminiClient: GoogleGenAI | null = null;
-
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured in server environment variables.');
-  }
-  if (!geminiClient) {
-    geminiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return geminiClient;
-}
 
 const aiResponseZodSchema = z.object({
   replyText: z.string().trim().min(1).max(1800),
@@ -246,10 +227,10 @@ export async function runAISalesAgent(params: {
     `</customer_message>`,
   ].join('\n');
 
-  const ai = getGeminiClient();
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: userPrompt,
+  const response = await executeWithGemini((ai) =>
+    ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: userPrompt,
     config: {
       systemInstruction,
       responseMimeType: 'application/json',
@@ -308,7 +289,8 @@ export async function runAISalesAgent(params: {
         ],
       },
     },
-  });
+  }),
+  );
 
   const rawText = (response.text ?? '').trim();
   if (!rawText) {

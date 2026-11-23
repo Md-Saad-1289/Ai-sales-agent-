@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { getCollections, getDatabaseStatus } from '../db/mongo.ts';
 import type { SettingsDoc } from '../types.ts';
+import { getGeminiPoolStatusSync, syncGeminiPoolMetrics } from './geminiClient.ts';
 
 export const updateSettingsSchema = z.object({
   businessName: z.string().trim().min(1).max(120),
@@ -22,7 +23,10 @@ export const updateSettingsSchema = z.object({
 export async function getSettings(): Promise<SettingsDoc> {
   const { settings } = getCollections();
   const existing = await settings.findOne({ key: 'primary' });
-  if (existing) return existing;
+  if (existing) {
+    syncGeminiPoolMetrics(existing);
+    return existing;
+  }
 
   const defaultDoc: Omit<SettingsDoc, '_id'> = {
     key: 'primary',
@@ -84,10 +88,13 @@ export async function updateSettings(input: z.infer<typeof updateSettingsSchema>
 
 export function getEnvironmentStatus() {
   const dbStatus = getDatabaseStatus();
+  const geminiPool = getGeminiPoolStatusSync();
   return {
     databaseMode: dbStatus.mode,
     databaseError: dbStatus.error,
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+    geminiConfigured: geminiPool.geminiConfigured,
+    geminiKeysCount: geminiPool.savedTotalCount + (geminiPool.envConfigured ? 1 : 0),
+    activeGeminiKeysCount: geminiPool.savedActiveCount + (geminiPool.envConfigured ? 1 : 0),
     metaPageTokenConfigured: Boolean(process.env.META_PAGE_ACCESS_TOKEN?.trim()),
     metaAppSecretConfigured: Boolean(process.env.META_APP_SECRET?.trim()),
     metaVerifyTokenConfigured: Boolean(process.env.META_VERIFY_TOKEN?.trim()),

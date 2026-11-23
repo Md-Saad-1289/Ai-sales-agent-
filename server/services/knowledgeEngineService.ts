@@ -13,7 +13,7 @@ import type {
   ProposedKnowledgePayload,
   ProposedProductPayload,
 } from '../types.ts';
-import { GEMINI_MODEL, getGeminiClient, withGeminiRetry } from './geminiClient.ts';
+import { executeWithGemini, GEMINI_MODEL } from './geminiClient.ts';
 import { KNOWLEDGE_CATEGORIES } from './memoryCompilerService.ts';
 import { emitRealtimeEvent } from './realtimeService.ts';
 import { getSettings } from './settingsService.ts';
@@ -432,8 +432,6 @@ export async function extractStructuredItemsFromText(params: {
   existingEntriesSummary: Array<{ id: string; category: string; title: string }>;
   existingProductsSummary: Array<{ id: string; name: string; price: number }>;
 }): Promise<ExtractedKnowledgeCandidate[]> {
-  const ai = getGeminiClient();
-
   const systemInstruction = [
     `You are the Knowledge Intelligence Engine for an AI Facebook Messenger Sales Agent.`,
     `Extract structured, atomic business knowledge items, behavioral rules, policies, FAQs, or product catalog proposals from the provided untrusted content.`,
@@ -456,7 +454,7 @@ export async function extractStructuredItemsFromText(params: {
     `</untrusted_content>`,
   ].join('\n\n');
 
-  const response = await withGeminiRetry(() =>
+  const response = await executeWithGemini((ai) =>
     ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,

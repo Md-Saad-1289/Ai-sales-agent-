@@ -7,6 +7,13 @@ import { getCollections } from '../db/mongo.ts';
 import type { KnowledgeCategory } from '../types.ts';
 import { listAuditLogs } from '../services/auditService.ts';
 import { MAX_UPLOAD_BYTES } from '../services/documentParserService.ts';
+import {
+  addGeminiApiKey,
+  deleteGeminiApiKey,
+  listGeminiKeySummaries,
+  testGeminiApiKey,
+  updateGeminiApiKey,
+} from '../services/geminiClient.ts';
 import { createProposalsFromExtractedItems } from '../services/knowledgeEngineService.ts';
 import {
   compileShortMemoryScript,
@@ -613,9 +620,12 @@ export function createApiRouter() {
   router.get('/settings', async (_req, res) => {
     try {
       const settings = await getSettings();
+      const { geminiApiKeys: _omitKeys, activeGeminiKeyId: _omitActive, ...safeSettings } = settings;
+      const keyPool = await listGeminiKeySummaries();
       res.json({
-        settings,
+        settings: safeSettings,
         environment: getEnvironmentStatus(),
+        geminiKeys: keyPool,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load settings.' });
@@ -630,12 +640,84 @@ export function createApiRouter() {
     }
     try {
       const settings = await updateSettings(parsed.data);
+      const { geminiApiKeys: _omitKeys, activeGeminiKeyId: _omitActive, ...safeSettings } = settings;
       res.json({
-        settings,
+        settings: safeSettings,
         environment: getEnvironmentStatus(),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save settings.' });
+    }
+  });
+
+  // Gemini API Key Pool Management
+  router.get('/settings/gemini-keys', async (_req, res) => {
+    try {
+      const pool = await listGeminiKeySummaries();
+      res.json({ ...pool, environment: getEnvironmentStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load Gemini keys.' });
+    }
+  });
+
+  router.post('/settings/gemini-keys', async (req, res) => {
+    const schema = z.object({
+      apiKey: z.string().trim().min(16, 'API key is too short.').max(256),
+      label: z.string().trim().max(80).optional(),
+      makePrimary: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid API key payload.' });
+      return;
+    }
+    try {
+      const created = await addGeminiApiKey(parsed.data);
+      const pool = await listGeminiKeySummaries();
+      res.status(201).json({ key: created, ...pool, environment: getEnvironmentStatus() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to add Gemini API key.' });
+    }
+  });
+
+  router.patch('/settings/gemini-keys/:id', async (req, res) => {
+    const schema = z.object({
+      label: z.string().trim().min(1).max(80).optional(),
+      isActive: z.boolean().optional(),
+      makePrimary: z.boolean().optional(),
+      resetStatus: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid update payload.' });
+      return;
+    }
+    try {
+      await updateGeminiApiKey(String(req.params.id), parsed.data);
+      const pool = await listGeminiKeySummaries();
+      res.json({ ...pool, environment: getEnvironmentStatus() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update Gemini API key.' });
+    }
+  });
+
+  router.post('/settings/gemini-keys/:id/test', async (req, res) => {
+    try {
+      const result = await testGeminiApiKey(String(req.params.id));
+      const pool = await listGeminiKeySummaries();
+      res.json({ ...result, ...pool, environment: getEnvironmentStatus() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to test API key.' });
+    }
+  });
+
+  router.delete('/settings/gemini-keys/:id', async (req, res) => {
+    try {
+      await deleteGeminiApiKey(String(req.params.id));
+      const pool = await listGeminiKeySummaries();
+      res.json({ ...pool, environment: getEnvironmentStatus() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to delete Gemini API key.' });
     }
   });
 

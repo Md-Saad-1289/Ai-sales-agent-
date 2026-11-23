@@ -655,7 +655,7 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
                           {msgDelivery === 'failed' && (
                             <>
                               <span aria-hidden="true">·</span>
-                              <span className="text-red-600">Delivery failed</span>
+                              <span className="text-red-600 font-medium">Delivery failed</span>
                             </>
                           )}
                         </div>
@@ -670,6 +670,11 @@ export function ConversationsPage({ initialConversationId }: ConversationsPagePr
                         >
                           {msgText}
                         </div>
+                        {msgDelivery === 'failed' && msg.deliveryError && (
+                          <p className="mt-1 px-1 max-w-[76%] text-[11px] text-red-600 text-right leading-snug">
+                            {msg.deliveryError}
+                          </p>
+                        )}
                       </div>
                     );
                   })

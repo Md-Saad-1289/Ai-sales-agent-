@@ -57,13 +57,21 @@ export async function sendMessengerText(params: {
       },
     );
 
-    const data = (await res.json()) as {
+    const rawBody = await res.text();
+    let data: {
       message_id?: string;
-      error?: { message?: string; code?: number };
-    };
+      error?: { message?: string; code?: number; error_subcode?: number };
+    } = {};
+    try {
+      data = JSON.parse(rawBody) as typeof data;
+    } catch {
+      // Non-JSON response from Meta
+    }
 
     if (!res.ok || data.error) {
-      throw new Error(data.error?.message || `Messenger Send API failed (${res.status})`);
+      const codeTag = data.error?.code ? ` (#${data.error.code})` : '';
+      const errMsg = data.error?.message || rawBody.slice(0, 180) || `Messenger Send API failed (${res.status})`;
+      throw new Error(`${errMsg}${codeTag}`);
     }
     lastMessageId = data.message_id;
   }

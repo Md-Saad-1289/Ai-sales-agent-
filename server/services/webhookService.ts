@@ -288,6 +288,7 @@ export async function processCustomerTurn(params: {
         const sendRes = await sendMessengerText({
           recipientId: customer.messengerId,
           text: replyText,
+          pageId: resolvedPageId,
         });
         if (sendRes.skipped) {
           deliveryStatus = 'failed';

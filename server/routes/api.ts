@@ -515,6 +515,7 @@ export function createApiRouter() {
           const sendRes = await sendMessengerText({
             recipientId: conversation.messengerId,
             text: parsed.data.text,
+            pageId: conversation.pageId,
           });
           if (sendRes.skipped) {
             deliveryStatus = 'failed';

@@ -26,6 +26,7 @@ async function fetchWithRetry(
 export async function sendMessengerText(params: {
   recipientId: string;
   text: string;
+  pageId?: string;
 }): Promise<{ messageId?: string; skipped?: boolean; reason?: string }> {
   const accessToken = process.env.META_PAGE_ACCESS_TOKEN?.trim();
   if (!accessToken) {
@@ -34,6 +35,9 @@ export async function sendMessengerText(params: {
       reason: 'META_PAGE_ACCESS_TOKEN is not configured on the server.',
     };
   }
+
+  const targetNode =
+    params.pageId && /^\d+$/.test(params.pageId.trim()) ? params.pageId.trim() : 'me';
 
   // Split long replies cleanly within Messenger's 2000-character message limit
   const chunks: string[] = [];
@@ -45,7 +49,7 @@ export async function sendMessengerText(params: {
   let lastMessageId: string | undefined;
   for (const chunk of chunks) {
     const res = await fetchWithRetry(
-      `${GRAPH_API_BASE}/me/messages?access_token=${encodeURIComponent(accessToken)}`,
+      `${GRAPH_API_BASE}/${targetNode}/messages?access_token=${encodeURIComponent(accessToken)}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -69,9 +73,22 @@ export async function sendMessengerText(params: {
     }
 
     if (!res.ok || data.error) {
-      const codeTag = data.error?.code ? ` (#${data.error.code})` : '';
-      const errMsg = data.error?.message || rawBody.slice(0, 180) || `Messenger Send API failed (${res.status})`;
-      throw new Error(`${errMsg}${codeTag}`);
+      const code = data.error?.code;
+      const codeTag = code ? ` (#${code})` : '';
+      const rawMsg =
+        data.error?.message || rawBody.slice(0, 180) || `Messenger Send API failed (${res.status})`;
+      const lower = rawMsg.toLowerCase();
+      if (
+        code === 100 ||
+        code === 200 ||
+        lower.includes('missing permissions') ||
+        lower.includes("object with id 'me'")
+      ) {
+        throw new Error(
+          `${rawMsg}${codeTag} — Ensure META_PAGE_ACCESS_TOKEN is a Facebook Page Access Token (not a User Token) generated with pages_messaging permission.`,
+        );
+      }
+      throw new Error(`${rawMsg}${codeTag}`);
     }
     lastMessageId = data.message_id;
   }
@@ -122,17 +139,24 @@ export async function verifyFacebookPageConnection(): Promise<{
 
   try {
     const res = await fetch(
-      `${GRAPH_API_BASE}/me?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
+      `${GRAPH_API_BASE}/me?fields=id,name&metadata=1&access_token=${encodeURIComponent(accessToken)}`,
     );
     const data = (await res.json()) as {
       id?: string;
       name?: string;
+      metadata?: { type?: string };
       error?: { message?: string };
     };
     if (!res.ok || data.error || !data.id) {
       return {
         connected: false,
         error: data.error?.message || 'Unable to verify Facebook Page token.',
+      };
+    }
+    if (data.metadata?.type && data.metadata.type !== 'page') {
+      return {
+        connected: false,
+        error: `META_PAGE_ACCESS_TOKEN is a "${data.metadata.type}" token, not a Facebook Page Access Token. Generate a Page token under Messenger -> API Setup with pages_messaging permission.`,
       };
     }
     return {
